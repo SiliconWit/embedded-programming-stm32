@@ -1,0 +1,638 @@
+---
+title: "Low-Power Modes and Production Firmware"
+description: "Build a battery-powered data logger with RTC wakeup, SPI flash storage, and STM32 Stop/Standby modes. Learn low-power design, flash programming, option bytes, and bootloader basics for production firmware"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-03-12
+tags: ["stm32", "low-power", "sleep", "rtc", "spi-flash", "production", "battery"]
+excerpt: "Build a battery-powered data logger that wakes from Stop mode every 60 seconds, reads a sensor, logs the data to SPI flash, and goes back to sleep. Design firmware for months of battery life on a CR2032 coin cell. Cover flash and option byte programming, bootloader basics, and production firmware considerations."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+Every embedded product eventually needs to run on batteries. The difference between firmware that drains a CR2032 in a week and firmware that runs for a year comes down to understanding sleep modes, wakeup sources, and peripheral power management. In this final lesson you will build a data logger that spends 99.9% of its time asleep, waking briefly to read a sensor, write to SPI flash, and go back to sleep. You will also learn the production firmware essentials: flash programming, option bytes, read protection, and bootloader basics. #STM32 #LowPower #Production
+
+## What We Are Building
+
+<Card title="Battery-Powered Data Logger" icon="star">
+A self-contained data logger powered by a CR2032 coin cell (3V, ~220 mAh). The STM32 sleeps in Stop mode between measurements. Every 60 seconds, the RTC alarm wakes the MCU. It reads the BME280 sensor over I2C, writes the timestamped data to a W25Q SPI flash chip, and returns to Stop mode. A serial command (via UART wakeup) lets you dump all logged data to a terminal for retrieval. The target is at least 6 months of operation on a single CR2032.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| Power source | CR2032 coin cell (3V, ~220 mAh) |
+| Sleep mode | Stop mode (1.4 uA typical, RTC running) |
+| Wakeup source | RTC Alarm A, every 60 seconds |
+| Sensor | BME280 on I2C1 (forced mode, then sleep) |
+| Storage | W25Q32 SPI flash (4 MB, ~330,000 log entries) |
+| Log entry size | 12 bytes (timestamp + temp + pressure + humidity) |
+| Serial interface | USART1 for data retrieval (wakeup on RX activity) |
+| Target battery life | 6+ months on CR2032 |
+
+### Bill of Materials
+
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| Blue Pill (STM32F103C8T6) | 1 | From previous lessons |
+| ST-Link V2 clone | 1 | For programming (disconnect for battery operation) |
+| CR2032 battery holder | 1 | Through-hole or SMD |
+| CR2032 coin cell | 1 | 3V lithium, ~220 mAh |
+| W25Q32 SPI flash module | 1 | 4 MB, 3.3V compatible |
+| BME280 breakout | 1 | From Lesson 5 |
+| Breadboard + jumper wires | 1 set | From previous lessons |
+
+## STM32 Low-Power Modes
+
+<InArticleAd />
+
+
+The STM32F103 offers three low-power modes with different tradeoffs between power consumption and wakeup time. Choosing the right mode depends on how often you need to wake up and how fast the MCU must respond after waking. For a data logger that wakes every 60 seconds, Stop mode provides the best balance: very low current consumption with all SRAM and register contents preserved.
+
+### Mode Comparison
+
+| Mode | Current (typical) | Wakeup Time | RAM Preserved | Peripherals | Wakeup Sources |
+|------|-------------------|-------------|---------------|-------------|----------------|
+| Sleep | ~2 mA | Immediate | Yes | All running | Any interrupt |
+| Stop | ~1.4 uA | ~5 us | Yes | Stopped (RTC runs) | EXTI, RTC alarm |
+| Standby | ~1.7 uA | ~50 us (reset) | No (lost) | All off (RTC optional) | WKUP pin, RTC, IWDG |
+
+### Why Stop Mode
+
+- **SRAM preserved:** All variables, peripheral configurations, and the stack survive sleep. After wakeup, execution continues from the WFI instruction. No need to reinitialize everything.
+- **RTC keeps running:** The LSE crystal (32.768 kHz) powers the RTC during Stop mode. RTC alarms can wake the MCU at precise intervals.
+- **Fast wakeup:** The MCU wakes in microseconds and resumes execution. Compare this to Standby mode, which triggers a full reset.
+- **Low enough:** 1.4 uA is sufficient for months of CR2032 operation.
+
+### Power Budget Calculation
+
+```
+Sleep current:      1.4 uA (Stop mode)
+Active current:     ~15 mA for ~50 ms (sensor read + flash write)
+Wakeup interval:    60 seconds
+
+Average current = (1.4 uA * 59.95 s + 15 mA * 0.05 s) / 60 s
+                = (83.93 uAs + 750 uAs) / 60 s
+                = 833.93 uAs / 60 s
+                = ~13.9 uA average
+
+CR2032 capacity:    220 mAh = 220,000 uAh
+Battery life:       220,000 uAh / 13.9 uA = ~15,827 hours = ~1.8 years
+```
+
+Even with real-world inefficiencies (voltage regulator quiescent current, flash leakage, self-discharge), 6+ months is achievable.
+
+## RTC Configuration and Alarm Wakeup
+
+<InArticleAd />
+
+
+The RTC on the STM32F103 is a simple 32-bit counter clocked by the LSE oscillator (32.768 kHz). It has a prescaler that divides 32768 Hz down to 1 Hz, incrementing the counter every second. The RTC alarm register triggers an interrupt when the counter matches the alarm value. During Stop mode, the RTC continues running on LSE power, which draws only a few hundred nanoamps.
+
+### RTC Initialization
+
+```c
+void rtc_init(void) {
+    /* Enable PWR and BKP clocks */
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+
+    /* Enable access to backup domain */
+    PWR->CR |= PWR_CR_DBP;
+
+    /* Enable LSE */
+    RCC->BDCR |= RCC_BDCR_LSEON;
+    while (!(RCC->BDCR & RCC_BDCR_LSERDY));
+
+    /* Select LSE as RTC clock source */
+    RCC->BDCR |= RCC_BDCR_RTCSEL_0;  /* LSE */
+    RCC->BDCR |= RCC_BDCR_RTCEN;     /* Enable RTC */
+
+    /* Wait for RTC synchronization */
+    while (!(RTC->CRL & RTC_CRL_RSF));
+
+    /* Enter configuration mode */
+    while (!(RTC->CRL & RTC_CRL_RTOFF));
+    RTC->CRL |= RTC_CRL_CNF;
+
+    /* Set prescaler for 1 Hz (32768 - 1) */
+    RTC->PRLH = 0;
+    RTC->PRLL = 32767;
+
+    /* Set counter to 0 */
+    RTC->CNTH = 0;
+    RTC->CNTL = 0;
+
+    /* Exit configuration mode */
+    RTC->CRL &= ~RTC_CRL_CNF;
+    while (!(RTC->CRL & RTC_CRL_RTOFF));
+}
+```
+
+### Setting the Next Alarm
+
+```c
+#define LOG_INTERVAL_SEC 60
+
+void rtc_set_alarm_relative(uint32_t seconds) {
+    uint32_t current = ((uint32_t)RTC->CNTH << 16) | RTC->CNTL;
+    uint32_t alarm_time = current + seconds;
+
+    while (!(RTC->CRL & RTC_CRL_RTOFF));
+    RTC->CRL |= RTC_CRL_CNF;
+
+    RTC->ALRH = (uint16_t)(alarm_time >> 16);
+    RTC->ALRL = (uint16_t)(alarm_time & 0xFFFF);
+
+    RTC->CRL &= ~RTC_CRL_CNF;
+    while (!(RTC->CRL & RTC_CRL_RTOFF));
+
+    /* Enable alarm interrupt */
+    RTC->CRH |= RTC_CRH_ALRIE;
+
+    /* Configure EXTI line 17 for RTC alarm (needed for Stop mode wakeup) */
+    EXTI->IMR |= EXTI_IMR_MR17;
+    EXTI->RTSR |= EXTI_RTSR_TR17;  /* Rising edge */
+
+    NVIC_SetPriority(RTCAlarm_IRQn, 1);
+    NVIC_EnableIRQ(RTCAlarm_IRQn);
+}
+
+void RTCAlarm_IRQHandler(void) {
+    if (EXTI->PR & EXTI_PR_PR17) {
+        EXTI->PR = EXTI_PR_PR17;  /* Clear EXTI pending */
+    }
+    if (RTC->CRL & RTC_CRL_ALRF) {
+        RTC->CRL &= ~RTC_CRL_ALRF;  /* Clear alarm flag */
+    }
+    /* CPU wakes from Stop mode and continues after WFI */
+}
+```
+
+## Entering Stop Mode
+
+<InArticleAd />
+
+
+```c
+void enter_stop_mode(void) {
+    /* Set the next wakeup alarm */
+    rtc_set_alarm_relative(LOG_INTERVAL_SEC);
+
+    /* Put BME280 into sleep mode */
+    bme280_sleep();
+
+    /* Put W25Q flash into power-down mode */
+    w25q_power_down();
+
+    /* Configure Stop mode */
+    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;  /* Enable deep sleep */
+
+    PWR->CR &= ~PWR_CR_PDDS;    /* Stop mode (not Standby) */
+    PWR->CR |= PWR_CR_LPDS;     /* Low-power regulator in Stop */
+
+    /* Clear wakeup flag */
+    PWR->CR |= PWR_CR_CWUF;
+
+    /* Enter Stop mode (WFI = Wait For Interrupt) */
+    __WFI();
+
+    /* Execution resumes here after RTC alarm wakes us */
+
+    /* Reconfigure clock (HSE + PLL, since Stop mode reverts to HSI) */
+    clock_init();
+
+    /* Clear deep sleep bit */
+    SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
+}
+```
+
+:::caution[Clock after Stop mode]
+When the STM32 exits Stop mode, the system clock reverts to the 8 MHz HSI oscillator. You must reconfigure HSE and PLL before accessing peripherals that depend on the 72 MHz clock (UART baud rates, SPI speeds, timer periods). Failing to do this is a common source of garbled serial output after wakeup.
+:::
+
+## W25Q SPI Flash Driver
+
+<InArticleAd />
+
+
+The W25Q32 is a 32 Mbit (4 MB) SPI NOR flash memory. It supports standard SPI at up to 104 MHz clock speed. Flash memory has a write constraint: you can only change bits from 1 to 0 by writing. To change bits from 0 to 1, you must erase an entire sector (4 KB). For data logging, you write sequentially through the flash, erasing sectors ahead of the write pointer when needed. The W25Q also has a power-down mode that reduces standby current from ~1 uA to ~0.1 uA.
+
+### Flash Commands
+
+| Command | Opcode | Description |
+|---------|--------|-------------|
+| Write Enable | 0x06 | Must precede every write/erase |
+| Page Program | 0x02 | Write up to 256 bytes |
+| Read Data | 0x03 | Read any number of bytes |
+| Sector Erase (4KB) | 0x20 | Erase 4096-byte sector |
+| Read Status Reg 1 | 0x05 | Check busy flag (bit 0) |
+| Power Down | 0xB9 | Enter low-power mode |
+| Release Power Down | 0xAB | Wake from power-down |
+| Read JEDEC ID | 0x9F | Manufacturer and device ID |
+
+### Driver Implementation
+
+```c
+#define W25Q_CS_LOW()   GPIOA->BRR = (1 << 4)
+#define W25Q_CS_HIGH()  GPIOA->BSRR = (1 << 4)
+
+void w25q_write_enable(void) {
+    W25Q_CS_LOW();
+    spi1_transfer(0x06);
+    W25Q_CS_HIGH();
+}
+
+void w25q_wait_busy(void) {
+    W25Q_CS_LOW();
+    spi1_transfer(0x05);
+    while (spi1_transfer(0xFF) & 0x01);  /* Wait until BUSY clears */
+    W25Q_CS_HIGH();
+}
+
+void w25q_sector_erase(uint32_t addr) {
+    w25q_write_enable();
+    W25Q_CS_LOW();
+    spi1_transfer(0x20);
+    spi1_transfer((addr >> 16) & 0xFF);
+    spi1_transfer((addr >> 8) & 0xFF);
+    spi1_transfer(addr & 0xFF);
+    W25Q_CS_HIGH();
+    w25q_wait_busy();  /* Sector erase takes 30-400 ms */
+}
+
+void w25q_page_program(uint32_t addr, const uint8_t *data, uint16_t len) {
+    if (len > 256) len = 256;
+
+    w25q_write_enable();
+    W25Q_CS_LOW();
+    spi1_transfer(0x02);
+    spi1_transfer((addr >> 16) & 0xFF);
+    spi1_transfer((addr >> 8) & 0xFF);
+    spi1_transfer(addr & 0xFF);
+    for (uint16_t i = 0; i < len; i++) {
+        spi1_transfer(data[i]);
+    }
+    W25Q_CS_HIGH();
+    w25q_wait_busy();
+}
+
+void w25q_read(uint32_t addr, uint8_t *buf, uint16_t len) {
+    W25Q_CS_LOW();
+    spi1_transfer(0x03);
+    spi1_transfer((addr >> 16) & 0xFF);
+    spi1_transfer((addr >> 8) & 0xFF);
+    spi1_transfer(addr & 0xFF);
+    for (uint16_t i = 0; i < len; i++) {
+        buf[i] = spi1_transfer(0xFF);
+    }
+    W25Q_CS_HIGH();
+}
+
+void w25q_power_down(void) {
+    W25Q_CS_LOW();
+    spi1_transfer(0xB9);
+    W25Q_CS_HIGH();
+}
+
+void w25q_wake(void) {
+    W25Q_CS_LOW();
+    spi1_transfer(0xAB);
+    W25Q_CS_HIGH();
+    for (volatile int i = 0; i < 100; i++);  /* tRES1 delay */
+}
+```
+
+## Data Logger Application
+
+<InArticleAd />
+
+
+### Log Entry Format
+
+```c
+typedef struct __attribute__((packed)) {
+    uint32_t timestamp;          /* RTC counter value */
+    int16_t  temperature_c10;    /* Celsius x 10 */
+    uint16_t pressure_hpa10;     /* hPa x 10 */
+    uint16_t humidity_pct10;     /* %RH x 10 */
+    uint16_t battery_mv;         /* Battery voltage in mV */
+} log_entry_t;  /* 12 bytes */
+```
+
+### Write Pointer Management
+
+```c
+#define FLASH_LOG_START   0x000000
+#define FLASH_LOG_END     0x3FFFFF   /* 4 MB */
+#define SECTOR_SIZE       4096
+#define ENTRY_SIZE        sizeof(log_entry_t)
+#define ENTRIES_PER_SECTOR (SECTOR_SIZE / ENTRY_SIZE)
+
+/* Store write pointer in backup register (survives Stop mode) */
+uint32_t get_write_pointer(void) {
+    return (BKP->DR1 | ((uint32_t)BKP->DR2 << 16));
+}
+
+void set_write_pointer(uint32_t addr) {
+    PWR->CR |= PWR_CR_DBP;  /* Enable backup domain write */
+    BKP->DR1 = (uint16_t)(addr & 0xFFFF);
+    BKP->DR2 = (uint16_t)(addr >> 16);
+}
+
+void log_write_entry(const log_entry_t *entry) {
+    uint32_t addr = get_write_pointer();
+
+    /* Erase sector if we are at a sector boundary */
+    if ((addr % SECTOR_SIZE) == 0) {
+        w25q_sector_erase(addr);
+    }
+
+    w25q_page_program(addr, (const uint8_t *)entry, ENTRY_SIZE);
+
+    addr += ENTRY_SIZE;
+    if (addr >= FLASH_LOG_END) {
+        addr = FLASH_LOG_START;  /* Wrap around */
+    }
+    set_write_pointer(addr);
+}
+```
+
+### Main Loop
+
+```c
+int main(void) {
+    clock_init();
+    rtc_init();
+    spi1_init();
+    i2c1_init();
+    uart_init();
+
+    /* Check if this is a fresh boot or wakeup from Stop */
+    if (!(PWR->CSR & PWR_CSR_WUF)) {
+        /* Fresh boot: initialize everything */
+        set_write_pointer(FLASH_LOG_START);
+        uart_send_string("Data logger initialized.\r\n");
+        uart_send_string("Commands: dump, status, reset\r\n");
+    }
+
+    while (1) {
+        /* Wake flash and sensor */
+        w25q_wake();
+        bme280_force_measurement();
+
+        /* Wait for BME280 measurement (~10 ms) */
+        for (volatile int i = 0; i < 100000; i++);
+
+        /* Read sensor data */
+        int32_t temp, press, hum;
+        bme280_read(&temp, (uint32_t *)&press, (uint32_t *)&hum);
+
+        /* Read battery voltage via ADC */
+        uint16_t batt_mv = read_battery_voltage();
+
+        /* Create log entry */
+        log_entry_t entry = {
+            .timestamp = ((uint32_t)RTC->CNTH << 16) | RTC->CNTL,
+            .temperature_c10 = (int16_t)(temp / 10),
+            .pressure_hpa10 = (uint16_t)(press / 10),
+            .humidity_pct10 = (uint16_t)(hum),
+            .battery_mv = batt_mv
+        };
+
+        /* Write to flash */
+        log_write_entry(&entry);
+
+        /* Check for serial commands before sleeping */
+        if (USART1->SR & USART_SR_RXNE) {
+            process_serial_commands();
+        }
+
+        /* Enter Stop mode until next RTC alarm */
+        enter_stop_mode();
+    }
+}
+```
+
+## Retrieving Logged Data
+
+<InArticleAd />
+
+
+```c
+void cmd_dump_log(void) {
+    uint32_t addr = FLASH_LOG_START;
+    uint32_t write_ptr = get_write_pointer();
+    log_entry_t entry;
+    char buf[80];
+    uint32_t count = 0;
+
+    uart_send_string("timestamp,temp_c,pressure_hpa,humidity_pct,battery_mv\r\n");
+
+    while (addr < write_ptr) {
+        w25q_read(addr, (uint8_t *)&entry, ENTRY_SIZE);
+
+        /* Skip erased entries (all 0xFF) */
+        if (entry.timestamp == 0xFFFFFFFF) {
+            addr += ENTRY_SIZE;
+            continue;
+        }
+
+        int16_t t_whole = entry.temperature_c10 / 10;
+        uint16_t t_frac = (entry.temperature_c10 < 0 ? -entry.temperature_c10 : entry.temperature_c10) % 10;
+        snprintf(buf, sizeof(buf),
+            "%lu,%s%d.%u,%u.%u,%u.%u,%u\r\n",
+            (unsigned long)entry.timestamp,
+            (entry.temperature_c10 < 0 && t_whole == 0) ? "-" : "",
+            t_whole, t_frac,
+            entry.pressure_hpa10 / 10, entry.pressure_hpa10 % 10,
+            entry.humidity_pct10 / 10, entry.humidity_pct10 % 10,
+            entry.battery_mv);
+        uart_send_string(buf);
+
+        addr += ENTRY_SIZE;
+        count++;
+    }
+
+    snprintf(buf, sizeof(buf), "\r\nTotal entries: %lu\r\n", (unsigned long)count);
+    uart_send_string(buf);
+}
+```
+
+## Production Firmware Considerations
+
+<InArticleAd />
+
+
+### Flash and Option Bytes
+
+The STM32F103 option bytes control read protection, write protection, watchdog configuration, and boot settings. They are stored in a special area of flash at address 0x1FFF_F800. Modifying option bytes requires unlocking the flash, erasing the option byte area, and writing new values. The most important option byte for production is read protection (RDP), which prevents the firmware from being read out through SWD.
+
+```c
+/* Enable read protection (Level 1) */
+void enable_read_protection(void) {
+    /* WARNING: This prevents SWD readout of flash.
+     * Reverting to Level 0 erases all flash contents. */
+    FLASH->KEYR = 0x45670123;   /* Unlock flash */
+    FLASH->KEYR = 0xCDEF89AB;
+
+    FLASH->OPTKEYR = 0x45670123;  /* Unlock option bytes */
+    FLASH->OPTKEYR = 0xCDEF89AB;
+
+    FLASH->CR |= FLASH_CR_OPTER;  /* Option byte erase */
+    FLASH->CR |= FLASH_CR_STRT;
+    while (FLASH->SR & FLASH_SR_BSY);
+
+    FLASH->CR &= ~FLASH_CR_OPTER;
+    FLASH->CR |= FLASH_CR_OPTPG;  /* Option byte program */
+
+    /* Write RDP key for Level 1 (any value except 0xA5) */
+    *(volatile uint16_t *)0x1FFFF800 = 0x00FF;
+
+    while (FLASH->SR & FLASH_SR_BSY);
+    FLASH->CR &= ~FLASH_CR_OPTPG;
+}
+```
+
+### Bootloader Basics
+
+The STM32F103 has a built-in system bootloader in ROM that supports UART firmware updates. By pulling Boot0 high and resetting, the MCU enters bootloader mode and accepts new firmware over USART1. For production, you might want a custom bootloader that lives in the first few KB of flash, verifies firmware integrity (CRC check), and jumps to the application. This lets you update firmware in the field without an ST-Link.
+
+```c
+/* Jump to system bootloader from application code */
+void jump_to_bootloader(void) {
+    /* System memory base address for STM32F103 */
+    uint32_t sys_mem_addr = 0x1FFFF000;
+
+    /* Disable all interrupts */
+    __disable_irq();
+
+    /* Reset all peripherals */
+    RCC->APB1RSTR = 0xFFFFFFFF;
+    RCC->APB1RSTR = 0;
+    RCC->APB2RSTR = 0xFFFFFFFF;
+    RCC->APB2RSTR = 0;
+
+    /* Set main stack pointer */
+    __set_MSP(*(volatile uint32_t *)sys_mem_addr);
+
+    /* Jump to bootloader reset handler */
+    void (*bootloader)(void) = (void (*)(void))(*(volatile uint32_t *)(sys_mem_addr + 4));
+    bootloader();
+}
+```
+
+### Production Checklist
+
+| Item | Purpose |
+|------|---------|
+| Enable read protection (RDP Level 1) | Prevent firmware theft |
+| Set watchdog in option bytes | Ensure recovery from firmware hangs |
+| Add CRC to firmware image | Detect corrupted flash |
+| Implement brown-out detection | Prevent operation at unsafe voltages |
+| Remove debug prints | Reduce power consumption and flash usage |
+| Verify all peripheral clocks disabled during sleep | Minimize Stop mode current |
+| Test battery voltage at startup | Warn or refuse to operate on low battery |
+| Add firmware version in a fixed flash location | Enable field identification |
+
+## Reducing Power Consumption Further
+
+<InArticleAd />
+
+
+### Peripheral Power Management
+
+```c
+void peripherals_off(void) {
+    /* Disable all peripheral clocks except RTC and backup domain */
+    RCC->APB1ENR = RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    RCC->APB2ENR = 0;
+    RCC->AHBENR = 0;
+
+    /* Set all unused GPIO pins to analog mode (lowest leakage) */
+    GPIOA->CRL = 0x00000000;
+    GPIOA->CRH = 0x00000000;
+    GPIOB->CRL = 0x00000000;
+    GPIOB->CRH = 0x00000000;
+    GPIOC->CRL = 0x00000000;
+    GPIOC->CRH = 0x00000000;
+}
+
+void peripherals_on(void) {
+    /* Re-enable needed clocks */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN
+                  | RCC_APB2ENR_SPI1EN | RCC_APB2ENR_USART1EN;
+    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN | RCC_APB1ENR_PWREN
+                  | RCC_APB1ENR_BKPEN;
+
+    /* Reconfigure GPIO pins */
+    spi1_gpio_init();
+    i2c1_gpio_init();
+    uart_gpio_init();
+}
+```
+
+### Blue Pill Power Optimization
+
+The Blue Pill board has components that draw current even when the MCU is asleep: the power LED (~2 mA), the 3.3V voltage regulator quiescent current (~5 mA for the AMS1117), and the USB pull-up resistor. For true low-power operation, you need to either desolder the power LED and regulator (powering the MCU directly from the CR2032 at 3V) or use a custom PCB with a low-quiescent-current LDO like the MCP1700 (~1.6 uA).
+
+| Component | Current Draw | Action |
+|-----------|-------------|--------|
+| AMS1117 regulator | ~5 mA quiescent | Replace with MCP1700 or power MCU directly |
+| Power LED | ~2 mA | Desolder or cut trace |
+| USB pull-up (R10) | ~2 mA when USB connected | Disconnect USB for battery operation |
+| STM32 in Stop mode | ~1.4 uA | Already optimized |
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 9 Complete" icon="approve-check">
+
+**Low-power design:**
+- STM32 Sleep, Stop, and Standby modes with current consumption and tradeoffs
+- RTC alarm configuration for periodic wakeup from Stop mode
+- Power budget calculation for battery life estimation
+- Peripheral clock and GPIO management for minimum leakage
+
+**Flash storage:**
+- W25Q SPI flash commands (read, write, erase, power down)
+- Sequential write strategy with sector erase for data logging
+- Write pointer storage in backup registers (survives sleep)
+- Data retrieval over serial as CSV
+
+**Production firmware:**
+- Flash and option byte programming
+- Read protection (RDP) to prevent firmware extraction
+- System bootloader access for field firmware updates
+- Production checklist for reliable deployed firmware
+- Brown-out detection and battery voltage monitoring
+
+**Course summary:**
+Over nine lessons you have built a complete STM32 skill set: from toolchain setup and bare-register GPIO to FreeRTOS multitasking and battery-powered production firmware. Every peripheral on the Blue Pill has been exercised, debugged, and understood at the register level. These foundations transfer directly to any STM32 family (F4, L4, H7) and to other ARM Cortex-M microcontrollers.
+</Card>
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

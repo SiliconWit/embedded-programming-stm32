@@ -1,0 +1,416 @@
+---
+title: "ADC with DMA and Analog Watchdog"
+description: "Build a voltage and current monitor with threshold alerts using the STM32 ADC with multi-channel DMA scanning, oversampling, and the analog watchdog peripheral"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-02-19
+tags: ["stm32", "adc", "dma", "analog-watchdog", "current-sensor", "ina219"]
+excerpt: "Build a voltage and current monitoring system that scans multiple ADC channels via DMA, uses hardware oversampling for noise reduction, and triggers analog watchdog alerts when readings exceed safe thresholds. Interface with an INA219 current sensor for precision current measurement."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+Monitoring voltage and current in real time is a fundamental skill for any embedded project, especially battery-powered designs. The STM32's ADC can continuously scan multiple analog channels and transfer results to memory via DMA without any CPU involvement. In this lesson you will combine that with the analog watchdog, a hardware comparator that fires an interrupt the instant a reading crosses your threshold, so your firmware reacts to dangerous conditions within microseconds. #STM32 #ADC #AnalogWatchdog
+
+## What We Are Building
+
+<Card title="Voltage and Current Monitor with Threshold Alerts" icon="star">
+A monitoring system that continuously reads voltage from a potentiometer (ADC channel) and current from an INA219 sensor module (I2C). The ADC runs in continuous scan mode with DMA, reading three channels: the potentiometer voltage, the internal temperature sensor, and the internal voltage reference. The analog watchdog monitors the potentiometer channel and triggers an alert (LED flash + serial warning) when the voltage exceeds a configurable threshold.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| ADC channels | PA0 (potentiometer), CH16 (temp sensor), CH17 (Vrefint) |
+| ADC mode | Continuous scan with DMA |
+| ADC clock | 12 MHz (72 MHz / 6, must be under 14 MHz) |
+| ADC resolution | 12-bit (0 to 4095) |
+| Analog watchdog | Monitors PA0, high threshold 3000 (~2.4V) |
+| Current sensor | INA219 on I2C1 (PB6/PB7), address 0x40 |
+| Serial output | USART1 on PA9 (115200 baud) |
+| Alert LED | PC13 (on-board LED, active low) |
+| Display update | 4 Hz on serial terminal |
+
+### Bill of Materials
+
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| Blue Pill (STM32F103C8T6) | 1 | From previous lessons |
+| ST-Link V2 clone | 1 | From previous lessons |
+| INA219 current sensor module | 1 | Breakout board with shunt resistor |
+| 10k potentiometer | 1 | For analog voltage input |
+| Breadboard + jumper wires | 1 set | From previous lessons |
+| Load resistor or LED with resistor | 1 | Something to draw current through the INA219 |
+
+## STM32F103 ADC Architecture
+
+<InArticleAd />
+
+
+The STM32F103 has two ADC peripherals (ADC1 and ADC2), each with 12-bit resolution and up to 1 MHz sampling rate. ADC1 has a dedicated DMA channel (DMA1 Channel 1), making it the preferred choice for continuous background conversions. The ADC can convert a sequence of up to 16 channels in a single scan, and in continuous mode it repeats the sequence automatically.
+
+### ADC Clock Requirements
+
+The ADC clock must be between 1 MHz and 14 MHz. It is derived from the APB2 clock through a prescaler:
+
+| APB2 Clock | Prescaler | ADC Clock |
+|------------|-----------|-----------|
+| 72 MHz | /6 | 12 MHz |
+| 72 MHz | /8 | 9 MHz |
+
+We use /6 for the fastest valid ADC clock (12 MHz).
+
+### Channel Assignment
+
+| Channel | Source | Notes |
+|---------|--------|-------|
+| CH0 | PA0 | Potentiometer voltage divider |
+| CH16 | Internal temp sensor | ~1.43V at 25C, 4.3 mV/C |
+| CH17 | Internal Vrefint | ~1.20V, used for calibration |
+
+## Multi-Channel ADC with DMA
+
+<InArticleAd />
+
+
+### ADC Initialization
+
+```c
+#define ADC_CHANNELS 3
+
+volatile uint16_t adc_values[ADC_CHANNELS];  /* DMA destination */
+
+void adc_init(void) {
+    /* Enable clocks */
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN | RCC_APB2ENR_IOPAEN;
+    RCC->AHBENR  |= RCC_AHBENR_DMA1EN;
+
+    /* ADC clock prescaler: 72 MHz / 6 = 12 MHz */
+    RCC->CFGR &= ~RCC_CFGR_ADCPRE;
+    RCC->CFGR |= RCC_CFGR_ADCPRE_DIV6;
+
+    /* PA0 as analog input */
+    GPIOA->CRL &= ~(0xF << 0);  /* MODE=00, CNF=00 = analog */
+
+    /* ADC1 configuration */
+    ADC1->CR2 = ADC_CR2_ADON;   /* Power on ADC (first write) */
+    for (volatile int i = 0; i < 10000; i++);  /* Stabilization delay */
+
+    /* Enable temperature sensor and Vrefint */
+    ADC1->CR2 |= ADC_CR2_TSVREFE;
+
+    /* Scan mode, continuous conversion, DMA enable */
+    ADC1->CR1 |= ADC_CR1_SCAN;
+    ADC1->CR2 |= ADC_CR2_CONT | ADC_CR2_DMA;
+
+    /* Sequence: 3 channels */
+    ADC1->SQR1 = (ADC_CHANNELS - 1) << 20;  /* Length = 3 */
+    ADC1->SQR3 = (0  << 0)    /* SQ1 = CH0 (PA0) */
+               | (16 << 5)    /* SQ2 = CH16 (temp) */
+               | (17 << 10);  /* SQ3 = CH17 (Vref) */
+
+    /* Sample time: 239.5 cycles for all channels (accurate readings) */
+    ADC1->SMPR2 |= (0x7 << 0);     /* CH0 */
+    ADC1->SMPR1 |= (0x7 << 18)     /* CH16 */
+                 |  (0x7 << 21);    /* CH17 */
+
+    /* Calibrate ADC */
+    ADC1->CR2 |= ADC_CR2_RSTCAL;
+    while (ADC1->CR2 & ADC_CR2_RSTCAL);
+    ADC1->CR2 |= ADC_CR2_CAL;
+    while (ADC1->CR2 & ADC_CR2_CAL);
+}
+```
+
+### DMA Configuration for ADC
+
+```c
+void adc_dma_init(void) {
+    /* DMA1 Channel 1 (ADC1) */
+    DMA1_Channel1->CCR = 0;  /* Disable first */
+
+    DMA1_Channel1->CPAR = (uint32_t)&ADC1->DR;
+    DMA1_Channel1->CMAR = (uint32_t)adc_values;
+    DMA1_Channel1->CNDTR = ADC_CHANNELS;
+
+    DMA1_Channel1->CCR = DMA_CCR_MINC      /* Memory increment */
+                       | DMA_CCR_PSIZE_0   /* Peripheral size: 16-bit */
+                       | DMA_CCR_MSIZE_0   /* Memory size: 16-bit */
+                       | DMA_CCR_CIRC      /* Circular mode */
+                       | DMA_CCR_TCIE;     /* Transfer complete interrupt */
+
+    DMA1_Channel1->CCR |= DMA_CCR_EN;
+
+    NVIC_SetPriority(DMA1_Channel1_IRQn, 2);
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+    /* Start continuous ADC conversion */
+    ADC1->CR2 |= ADC_CR2_ADON;  /* Start conversion (second write) */
+}
+
+void DMA1_Channel1_IRQHandler(void) {
+    if (DMA1->ISR & DMA_ISR_TCIF1) {
+        DMA1->IFCR = DMA_IFCR_CTCIF1;
+        /* adc_values[] is now updated with fresh readings */
+        /* CH0 = adc_values[0], Temp = adc_values[1], Vref = adc_values[2] */
+    }
+}
+```
+
+## Analog Watchdog
+
+<InArticleAd />
+
+
+The analog watchdog is a hardware feature that compares every ADC conversion result against programmable high and low thresholds. When a conversion falls outside the allowed range, it sets a flag and optionally triggers an interrupt. This happens in hardware at ADC speed, so your firmware is notified within one conversion cycle (about 20 us at 12 MHz). Compare this to polling the ADC value in software, which depends on your loop speed and could miss brief spikes entirely.
+
+### Watchdog Configuration
+
+```c
+#define AWD_HIGH_THRESHOLD  3000  /* ~2.4V at 3.3V reference */
+#define AWD_LOW_THRESHOLD   100   /* ~0.08V (near ground fault) */
+
+void analog_watchdog_init(void) {
+    /* Monitor single channel (CH0 = PA0) */
+    ADC1->CR1 |= ADC_CR1_AWDSGL;    /* Single channel mode */
+    ADC1->CR1 &= ~ADC_CR1_AWDCH;    /* Channel 0 */
+    ADC1->CR1 |= ADC_CR1_AWDEN;     /* Enable on regular channels */
+
+    /* Set thresholds */
+    ADC1->HTR = AWD_HIGH_THRESHOLD;
+    ADC1->LTR = AWD_LOW_THRESHOLD;
+
+    /* Enable analog watchdog interrupt */
+    ADC1->CR1 |= ADC_CR1_AWDIE;
+
+    NVIC_SetPriority(ADC1_2_IRQn, 0);  /* Highest priority */
+    NVIC_EnableIRQ(ADC1_2_IRQn);
+}
+
+volatile uint8_t threshold_alert = 0;
+
+void ADC1_2_IRQHandler(void) {
+    if (ADC1->SR & ADC_SR_AWD) {
+        ADC1->SR &= ~ADC_SR_AWD;  /* Clear flag */
+
+        threshold_alert = 1;
+
+        /* Immediate response: flash alert LED */
+        GPIOC->ODR ^= (1 << 13);  /* Toggle PC13 */
+    }
+}
+```
+
+## Software Oversampling
+
+<InArticleAd />
+
+
+The STM32F103 ADC does not have hardware oversampling (unlike newer STM32 families like the L4 or G4). However, you can implement it in software by averaging multiple samples. Oversampling by 4x and dividing by 2 gives you approximately 1 extra bit of resolution (from 12-bit to ~13-bit effective). Oversampling by 16x and dividing by 4 gives about 2 extra bits. The DMA circular mode makes this easy because the buffer continuously refills.
+
+```c
+#define OVERSAMPLE_COUNT 16
+#define ADC_BUF_SIZE (ADC_CHANNELS * OVERSAMPLE_COUNT)
+
+volatile uint16_t adc_raw_buf[ADC_BUF_SIZE];
+
+/* Average N samples for each channel */
+uint16_t adc_get_averaged(uint8_t channel) {
+    uint32_t sum = 0;
+    for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+        sum += adc_raw_buf[i * ADC_CHANNELS + channel];
+    }
+    return (uint16_t)(sum / OVERSAMPLE_COUNT);
+}
+```
+
+## INA219 Current Sensor (I2C)
+
+<InArticleAd />
+
+
+The INA219 is a high-side current and power monitor with an I2C interface. It measures the voltage drop across a shunt resistor to calculate current, and it also measures the bus voltage. Most INA219 breakout boards include a 0.1 ohm shunt resistor, giving a maximum measurement range of about 3.2A. The INA219 has a built-in 12-bit ADC, so it returns calibrated current and power values directly over I2C.
+
+### INA219 Driver
+
+```c
+#define INA219_ADDR 0x40
+
+#define INA219_REG_CONFIG    0x00
+#define INA219_REG_SHUNT_V  0x01
+#define INA219_REG_BUS_V    0x02
+#define INA219_REG_POWER    0x03
+#define INA219_REG_CURRENT  0x04
+#define INA219_REG_CALIB    0x05
+
+void ina219_init(void) {
+    /* Reset */
+    uint16_t config = 0x8000;  /* Reset bit */
+    i2c1_write_reg16(INA219_ADDR, INA219_REG_CONFIG, config);
+    for (volatile int i = 0; i < 100000; i++);
+
+    /* Configuration: 32V range, 320mV shunt range, 12-bit, continuous */
+    config = (0x1 << 13)    /* Bus voltage range: 32V */
+           | (0x3 << 11)    /* Shunt voltage range: 320 mV */
+           | (0x3 << 7)     /* Bus ADC: 12-bit */
+           | (0x3 << 3)     /* Shunt ADC: 12-bit */
+           | (0x7);         /* Mode: continuous shunt + bus */
+    i2c1_write_reg16(INA219_ADDR, INA219_REG_CONFIG, config);
+
+    /* Calibration for 0.1 ohm shunt, 1 mA/LSB */
+    /* Cal = trunc(0.04096 / (Current_LSB * R_shunt)) */
+    /* Cal = trunc(0.04096 / (0.001 * 0.1)) = 4096 */
+    i2c1_write_reg16(INA219_ADDR, INA219_REG_CALIB, 4096);
+}
+
+int16_t ina219_read_current_ma(void) {
+    return (int16_t)i2c1_read_reg16(INA219_ADDR, INA219_REG_CURRENT);
+}
+
+uint16_t ina219_read_bus_voltage_mv(void) {
+    uint16_t raw = i2c1_read_reg16(INA219_ADDR, INA219_REG_BUS_V);
+    /* Bus voltage is in bits [15:3], LSB = 4 mV */
+    return (raw >> 3) * 4;
+}
+```
+
+## Converting ADC Readings to Physical Units
+
+<InArticleAd />
+
+
+```c
+/* Convert ADC reading to millivolts (3.3V reference) */
+uint32_t adc_to_mv(uint16_t adc_val) {
+    return (uint32_t)adc_val * 3300 / 4095;
+}
+
+/* Internal temperature sensor (from datasheet) */
+int32_t adc_to_temp_c10(uint16_t adc_val) {
+    /* V_sense = adc_val * 3300 / 4095 (in mV) */
+    /* T(C) = (V25 - V_sense) / Avg_Slope + 25 */
+    /* V25 = 1430 mV, Avg_Slope = 4.3 mV/C */
+    int32_t v_sense = (int32_t)adc_val * 3300 / 4095;
+    return ((1430 - v_sense) * 10) / 43 + 250;  /* Result in C x 10 */
+}
+```
+
+## Main Application
+
+<InArticleAd />
+
+
+```c
+int main(void) {
+    clock_init();
+    systick_init();
+    uart_init();
+    i2c1_init();
+
+    /* LED on PC13 as alert indicator */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    GPIOC->CRH &= ~(0xF << 20);
+    GPIOC->CRH |= (0x3 << 20);
+    GPIOC->BSRR = (1 << 13);  /* LED off (active low) */
+
+    adc_init();
+    analog_watchdog_init();
+    adc_dma_init();
+    ina219_init();
+
+    char buf[128];
+    uint32_t last_print = 0;
+
+    uart_send_string("\r\n=== Voltage/Current Monitor ===\r\n\r\n");
+
+    while (1) {
+        if ((systick_ms - last_print) >= 250) {  /* 4 Hz update */
+            last_print = systick_ms;
+
+            uint16_t pot_adc = adc_values[0];
+            uint32_t pot_mv = adc_to_mv(pot_adc);
+            int32_t temp_c10 = adc_to_temp_c10(adc_values[1]);
+            uint32_t vref_mv = adc_to_mv(adc_values[2]);
+
+            int16_t current_ma = ina219_read_current_ma();
+            uint16_t bus_mv = ina219_read_bus_voltage_mv();
+
+            snprintf(buf, sizeof(buf),
+                "POT: %lumV (ADC:%u) | Temp: %ld.%ldC | "
+                "Vref: %lumV | I: %dmA | Vbus: %umV",
+                (unsigned long)pot_mv, pot_adc,
+                (long)(temp_c10 / 10), (long)(temp_c10 % 10),
+                (unsigned long)vref_mv,
+                current_ma, bus_mv);
+            uart_send_string(buf);
+
+            if (threshold_alert) {
+                threshold_alert = 0;
+                uart_send_string(" [ALERT!]");
+            }
+            uart_send_string("\r\n");
+        }
+
+        __WFI();
+    }
+}
+```
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 6 Complete" icon="approve-check">
+
+**ADC skills:**
+- Multi-channel continuous scan mode configuration
+- ADC clock prescaler requirements (1-14 MHz)
+- Sample time selection for accuracy vs. speed
+- ADC calibration sequence
+- Converting raw ADC values to physical units (voltage, temperature)
+
+**DMA skills:**
+- ADC-to-memory DMA with circular mode for continuous updates
+- Buffer sizing for multi-channel scans
+- Software oversampling using DMA circular buffers
+
+**Analog watchdog:**
+- Hardware threshold monitoring with high/low limits
+- Single-channel watchdog configuration
+- Interrupt-driven alert response at ADC speed
+
+**Sensor integration:**
+- INA219 current sensor initialization and calibration over I2C
+- Reading bus voltage and current from I2C registers
+- Combining internal ADC readings with external I2C sensor data
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 7: Debugging with SWD, GDB, and Fault Handlers](/education/embedded-programming-stm32/debugging-swd-gdb-fault-handlers), you will tackle a bug hunt challenge with pre-written buggy firmware. Using GDB, SWD breakpoints, watchpoints, and HardFault decoding, you will find and fix five embedded bugs that would be nearly impossible to catch by reading code alone.
+:::
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

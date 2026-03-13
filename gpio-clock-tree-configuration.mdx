@@ -1,0 +1,419 @@
+---
+title: "GPIO and Clock Tree Configuration"
+description: "Master the STM32 RCC clock tree, AHB/APB bus architecture, and all four GPIO modes. Build a rotary encoder menu system that outputs to a serial terminal using the Blue Pill board"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-01-22
+tags: ["stm32", "gpio", "clock-tree", "rcc", "rotary-encoder"]
+excerpt: "Build a rotary encoder menu system on the Blue Pill that navigates options and displays them over serial. Dive deep into the RCC clock tree, AHB/APB bus prescalers, GPIO input/output/alternate/analog modes, and alternate function mapping."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+A rotary encoder gives you infinite rotation with detented clicks, plus a push button, all from a single component. In this lesson you will wire a KY-040 encoder to the Blue Pill, read its quadrature signals through GPIO inputs, and build a scrollable menu that prints to a serial terminal. Along the way you will map out the full RCC clock tree and learn every GPIO configuration mode the STM32F103 offers. #STM32 #GPIO #ClockTree
+
+## What We Are Building
+
+<Card title="Rotary Encoder Menu System" icon="star">
+A terminal-based menu where rotating the encoder scrolls through options and pressing the encoder button selects the current item. The menu displays over UART serial at 115200 baud, with the selected item highlighted. The encoder is read using GPIO input with internal pull-ups and simple software debouncing. Clock configuration is done at the register level to understand every RCC register involved.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| Encoder | KY-040 rotary encoder module |
+| Encoder pins | CLK on PB6, DT on PB7, SW on PB5 |
+| Serial output | USART1 TX on PA9 (115200 baud) |
+| System clock | 72 MHz (HSE + PLL) |
+| GPIO modes used | Input pull-up, alternate function push-pull |
+| Debounce method | Software timer (SysTick based) |
+
+### Bill of Materials
+
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| Blue Pill (STM32F103C8T6) | 1 | From Lesson 1 |
+| ST-Link V2 clone | 1 | From Lesson 1 |
+| KY-040 rotary encoder module | 1 | Includes pull-up resistors on the module |
+| Breadboard | 1 | From Lesson 1 |
+| Jumper wires | 5+ | For connections |
+| USB-to-serial adapter (optional) | 1 | If not using ST-Link virtual COM |
+
+## The RCC Clock Tree
+
+<InArticleAd />
+
+
+Every peripheral on the STM32 is clocked through the RCC (Reset and Clock Control) module. Before you can use a GPIO port, a timer, or a UART, you must enable its clock in the RCC. If you forget this step, writing to peripheral registers has no effect, and reading them returns zero. This is the single most common mistake when starting with STM32.
+
+### Clock Sources
+
+The STM32F103 has four clock sources:
+
+| Source | Frequency | Notes |
+|--------|-----------|-------|
+| HSI | 8 MHz | Internal RC oscillator, less accurate, always available |
+| HSE | 4-16 MHz | External crystal (8 MHz on Blue Pill), accurate |
+| LSI | ~40 kHz | Internal, used for independent watchdog |
+| LSE | 32.768 kHz | External crystal for RTC |
+
+### PLL Configuration
+
+The PLL takes either HSI/2 (4 MHz) or HSE (8 MHz) as input and multiplies it by a factor of 2 to 16. For maximum performance, we use HSE x 9 = 72 MHz. The PLL output feeds the system clock (SYSCLK), which then passes through prescalers for the AHB, APB1, and APB2 buses.
+
+### Bus Architecture
+
+```
+HSE (8 MHz) --> PLL (x9) --> SYSCLK (72 MHz)
+                                |
+                                +--> AHB (72 MHz, /1)
+                                |       |
+                                |       +--> APB2 (72 MHz, /1)
+                                |       |     GPIO, USART1, SPI1, TIM1, ADC
+                                |       |
+                                |       +--> APB1 (36 MHz, /2)
+                                |             USART2/3, SPI2, TIM2-4, I2C, USB
+                                |
+                                +--> Cortex System Timer (SysTick)
+```
+
+Key points:
+- **AHB** (Advanced High-performance Bus): runs at SYSCLK speed, carries DMA, memory, and Cortex core traffic
+- **APB2** (Advanced Peripheral Bus 2): high-speed peripherals including GPIO, USART1, SPI1, ADC, and advanced timer TIM1
+- **APB1**: limited to 36 MHz maximum, serves USART2/3, SPI2, I2C, basic timers, and USB
+
+### Enabling Peripheral Clocks
+
+```c
+/* Enable GPIOA clock (APB2 bus) */
+RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+
+/* Enable GPIOB clock (APB2 bus) */
+RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+
+/* Enable USART1 clock (APB2 bus) */
+RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+
+/* Enable TIM2 clock (APB1 bus) */
+RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+```
+
+:::caution[Clock enable timing]
+After enabling a peripheral clock, the STM32 needs a few cycles before the peripheral registers become accessible. A single read-back of the RCC register is enough delay. In practice, the instructions between enabling the clock and accessing the peripheral usually provide sufficient delay, but be aware of this if you access a peripheral immediately after enabling its clock.
+:::
+
+## GPIO Modes on STM32F103
+
+<InArticleAd />
+
+
+The STM32F103 GPIO system is configured through two 32-bit configuration registers per port: CRL (pins 0-7) and CRH (pins 8-15). Each pin gets 4 bits of configuration, split into 2-bit MODE and 2-bit CNF fields. This is different from newer STM32 families (F4, L4, etc.) that use separate MODER, OTYPER, OSPEEDR, and PUPDR registers. The F103 approach is more compact but less intuitive.
+
+### The Four GPIO Modes
+
+| Mode | MODE bits | CNF bits | Use case |
+|------|-----------|----------|----------|
+| Input floating | 00 | 01 | Default after reset |
+| Input pull-up/pull-down | 00 | 10 | Buttons, encoders |
+| Input analog | 00 | 00 | ADC channels |
+| Output push-pull | 01/10/11 | 00 | Driving LEDs, signals |
+| Output open-drain | 01/10/11 | 01 | I2C, level shifting |
+| Alternate function push-pull | 01/10/11 | 10 | UART TX, SPI, PWM |
+| Alternate function open-drain | 01/10/11 | 11 | I2C SDA/SCL |
+
+The MODE bits also set the output speed: 00 = input, 01 = 10 MHz, 10 = 2 MHz, 11 = 50 MHz.
+
+### Configuring a Pin (Register Level)
+
+```c
+/* PA9 as alternate function push-pull, 50 MHz (USART1 TX) */
+/* PA9 is in CRH, position (9-8)*4 = 4 bits starting at bit 4 */
+GPIOA->CRH &= ~(0xF << 4);    /* Clear bits [7:4] */
+GPIOA->CRH |=  (0xB << 4);    /* MODE=11 (50MHz), CNF=10 (AF push-pull) */
+
+/* PB6 as input with pull-up (encoder CLK) */
+/* PB6 is in CRL, position 6*4 = 24 */
+GPIOB->CRL &= ~(0xF << 24);   /* Clear bits [27:24] */
+GPIOB->CRL |=  (0x8 << 24);   /* MODE=00 (input), CNF=10 (pull-up/down) */
+GPIOB->ODR |=  (1 << 6);      /* ODR bit selects pull-UP (vs pull-down) */
+```
+
+### Alternate Function Remapping
+
+Some peripheral signals can be remapped to alternative pins using the AFIO (Alternate Function I/O) registers. For example, USART1 TX defaults to PA9 but can be remapped to PB6. To use remapped pins, you must enable the AFIO clock and set the appropriate remap bits. In this lesson we use default pin assignments, so no remapping is needed.
+
+```c
+/* Enable AFIO clock (required for any remapping) */
+RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+
+/* Example: remap USART1 to PB6/PB7 (not used in this project) */
+AFIO->MAPR |= AFIO_MAPR_USART1_REMAP;
+```
+
+## Reading the Rotary Encoder
+
+<InArticleAd />
+
+
+The KY-040 rotary encoder outputs two quadrature signals (CLK and DT) that are 90 degrees out of phase. When you rotate clockwise, CLK leads DT. When you rotate counterclockwise, DT leads CLK. By reading both signals on each CLK edge, you can determine both the direction and the number of steps. The push button (SW) is a simple active-low signal.
+
+### Wiring
+
+| KY-040 Pin | Blue Pill Pin | Configuration |
+|------------|---------------|---------------|
+| CLK | PB6 | Input pull-up |
+| DT | PB7 | Input pull-up |
+| SW | PB5 | Input pull-up |
+| + | 3.3V | Power |
+| GND | GND | Ground |
+
+### Encoder Reading Code
+
+```c
+typedef struct {
+    int16_t position;
+    uint8_t last_clk;
+    uint8_t button_pressed;
+    uint32_t last_button_time;
+} encoder_t;
+
+void encoder_init(encoder_t *enc) {
+    /* Enable GPIOB clock */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+
+    /* PB5, PB6, PB7 as input with pull-up */
+    GPIOB->CRL &= ~(0xFFF << 20);      /* Clear config for PB5, PB6, PB7 */
+    GPIOB->CRL |=  (0x888 << 20);      /* Input with pull-up/pull-down */
+    GPIOB->ODR |=  (1 << 5) | (1 << 6) | (1 << 7);  /* Select pull-up */
+
+    enc->position = 0;
+    enc->last_clk = (GPIOB->IDR >> 6) & 1;
+    enc->button_pressed = 0;
+    enc->last_button_time = 0;
+}
+
+void encoder_update(encoder_t *enc, uint32_t tick_ms) {
+    uint8_t clk = (GPIOB->IDR >> 6) & 1;
+    uint8_t dt  = (GPIOB->IDR >> 7) & 1;
+    uint8_t sw  = (GPIOB->IDR >> 5) & 1;
+
+    /* Detect CLK falling edge */
+    if (enc->last_clk == 1 && clk == 0) {
+        if (dt == 1) {
+            enc->position++;    /* Clockwise */
+        } else {
+            enc->position--;    /* Counterclockwise */
+        }
+    }
+    enc->last_clk = clk;
+
+    /* Button with 50ms debounce */
+    if (sw == 0 && (tick_ms - enc->last_button_time) > 50) {
+        enc->button_pressed = 1;
+        enc->last_button_time = tick_ms;
+    }
+}
+```
+
+## UART Serial Output
+
+<InArticleAd />
+
+
+### USART1 Initialization
+
+```c
+void uart_init(void) {
+    /* Enable GPIOA and USART1 clocks */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_USART1EN;
+
+    /* PA9 (TX) as alternate function push-pull, 50 MHz */
+    GPIOA->CRH &= ~(0xF << 4);
+    GPIOA->CRH |=  (0xB << 4);
+
+    /* PA10 (RX) as input floating (not used here, but good practice) */
+    GPIOA->CRH &= ~(0xF << 8);
+    GPIOA->CRH |=  (0x4 << 8);
+
+    /* Baud rate: 115200 at 72 MHz APB2 clock */
+    /* BRR = 72000000 / 115200 = 625 = 0x271 */
+    USART1->BRR = 0x271;
+
+    /* Enable USART, TX */
+    USART1->CR1 = USART_CR1_UE | USART_CR1_TE;
+}
+
+void uart_send_char(char c) {
+    while (!(USART1->SR & USART_SR_TXE));
+    USART1->DR = c;
+}
+
+void uart_send_string(const char *str) {
+    while (*str) {
+        uart_send_char(*str++);
+    }
+}
+```
+
+## Building the Menu System
+
+<InArticleAd />
+
+
+### SysTick for Timing
+
+```c
+volatile uint32_t systick_ms = 0;
+
+void SysTick_Handler(void) {
+    systick_ms++;
+}
+
+void systick_init(void) {
+    /* SysTick reload: 72 MHz / 1000 = 72000 ticks per ms */
+    SysTick->LOAD = 72000 - 1;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk |
+                    SysTick_CTRL_TICKINT_Msk |
+                    SysTick_CTRL_ENABLE_Msk;
+}
+```
+
+### Menu Display
+
+```c
+#define MENU_ITEMS 5
+
+const char *menu_labels[MENU_ITEMS] = {
+    "1. LED Brightness",
+    "2. Blink Speed",
+    "3. Serial Baud Rate",
+    "4. Clock Info",
+    "5. Reset Settings"
+};
+
+void menu_display(int16_t selected) {
+    /* ANSI escape: clear screen and move cursor home */
+    uart_send_string("\033[2J\033[H");
+    uart_send_string("=== STM32 Settings Menu ===\r\n\r\n");
+
+    for (int i = 0; i < MENU_ITEMS; i++) {
+        if (i == selected) {
+            uart_send_string("  > ");   /* Highlight selected */
+        } else {
+            uart_send_string("    ");
+        }
+        uart_send_string(menu_labels[i]);
+        uart_send_string("\r\n");
+    }
+
+    uart_send_string("\r\nRotate to navigate, press to select.\r\n");
+}
+```
+
+### Main Loop
+
+```c
+int main(void) {
+    clock_init();       /* 72 MHz from HSE + PLL */
+    systick_init();     /* 1 ms tick */
+    uart_init();        /* 115200 baud on PA9 */
+
+    encoder_t enc;
+    encoder_init(&enc);
+
+    int16_t last_position = 0;
+    int16_t menu_index = 0;
+
+    menu_display(menu_index);
+
+    while (1) {
+        encoder_update(&enc, systick_ms);
+
+        /* Update menu on rotation */
+        if (enc.position != last_position) {
+            int16_t delta = enc.position - last_position;
+            last_position = enc.position;
+
+            menu_index += delta;
+
+            /* Wrap around */
+            if (menu_index < 0) menu_index = MENU_ITEMS - 1;
+            if (menu_index >= MENU_ITEMS) menu_index = 0;
+
+            menu_display(menu_index);
+        }
+
+        /* Handle button press */
+        if (enc.button_pressed) {
+            enc.button_pressed = 0;
+            uart_send_string("\r\nSelected: ");
+            uart_send_string(menu_labels[menu_index]);
+            uart_send_string("\r\n");
+
+            /* Add action handlers here */
+            for (volatile uint32_t i = 0; i < 500000; i++);
+            menu_display(menu_index);
+        }
+    }
+}
+```
+
+### Testing
+
+Connect PA9 (TX) to a USB-to-serial adapter's RX pin (or use the ST-Link's virtual COM if supported). Open a serial terminal at 115200 baud. You should see the menu. Rotating the encoder scrolls through options, and pressing it prints the selected item.
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 2 Complete" icon="approve-check">
+
+**Clock tree knowledge:**
+- Four clock sources (HSI, HSE, LSI, LSE) and their characteristics
+- PLL configuration for 72 MHz from 8 MHz HSE
+- AHB and APB bus prescalers and their speed limits
+- Enabling peripheral clocks through RCC registers
+
+**GPIO skills:**
+- All four GPIO modes (input, output, alternate function, analog)
+- CRL/CRH register configuration with MODE and CNF bit fields
+- Internal pull-up/pull-down selection via ODR register
+- Alternate function remapping through AFIO
+
+**Peripheral skills:**
+- Reading quadrature encoder signals with direction detection
+- Software debouncing with SysTick millisecond timer
+- USART1 initialization and character transmission at register level
+- SysTick configuration for 1 ms system tick
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 3: Timers, PWM, and Input Capture](/education/embedded-programming-stm32/timers-pwm-input-capture), you will build a servo-driven pan mechanism controlled by the rotary encoder. You will explore general-purpose and advanced timers, PWM generation, output compare, input capture, and the hardware encoder interface built into the STM32 timers.
+:::
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

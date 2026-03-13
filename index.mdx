@@ -1,10 +1,10 @@
 ---
 title: "Embedded Programming: STM32"
 description: "Program STM32 ARM Cortex-M microcontrollers from toolchain setup to production firmware. Nine lessons covering GPIO, timers, DMA, UART, SPI, I2C, debugging with SWD/GDB, FreeRTOS, and low-power design. Each lesson builds a real project on the Blue Pill."
-pubDate: 2026-03-21
+pubDate: 2026-01-15
 tags: ["embedded-systems", "stm32", "arm-cortex-m", "hal", "bare-metal", "c-programming", "freertos", "debugging", "swd", "dma", "blue-pill"]
 excerpt: "Master STM32 ARM Cortex-M programming with both HAL and register-level access. Each lesson builds a real project on the Blue Pill. Covers clock configuration, DMA, debugging with SWD and GDB, FreeRTOS multitasking, and production-ready low-power firmware."
-heroImage: "https://cdn.siliconwit.com/education/pcb-design-kicad/pcb-design-kicad.png"
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
 ---
 
 import Copyright from '../../../../components/Copyright.astro';
@@ -151,15 +151,19 @@ Each lesson follows a consistent cycle:
 
 2. **Install the toolchain**: arm-none-eabi-gcc, OpenOCD, and STM32CubeMX. Lesson 1 covers setup on Linux, macOS, and Windows.
 
-3. **Download the STM32F103 reference manual** (RM0008) from [ST Microelectronics](https://www.st.com/en/microcontrollers-microprocessors/stm32f103c8.html). This is your primary reference.
+3. **Download the STM32F103 reference manual** (RM0008) from [ST Microelectronics (PDF)](https://www.st.com/resource/en/reference_manual/cd00171190-stm32f101xx-stm32f102xx-stm32f103xx-stm32f105xx-and-stm32f107xx-advanced-arm-based-32-bit-mcus-stmicroelectronics.pdf) ([product page](https://www.st.com/en/microcontrollers-microprocessors/stm32f103c8.html)). This is your primary reference, covering every register in the chip.
 
 4. **Start with Lesson 1.** Wire the ST-Link to the Blue Pill and flash your first program.
 
 5. **Work through lessons in order.** Each builds on peripherals and patterns from previous lessons.
 </Steps>
 
+:::note[Blue Pill or Black Pill?]
+This course uses the Blue Pill (STM32F103C8T6, Cortex-M3, 72 MHz, 64 KB flash). The Black Pill (STM32F411CEU6, Cortex-M4F, 100 MHz, 512 KB flash) is more powerful with an FPU and more memory, and every lesson in this course works on it with minor pin and clock adjustments. If you plan to continue beyond this course, the Black Pill gives you more room to grow. Either board is a fine starting point.
+:::
+
 :::tip[Coming from Arduino?]
-If you completed the ATmega328P course, the jump to STM32 will feel natural. The concepts are the same (GPIO, timers, UART, SPI, I2C), but the STM32 adds clock trees, DMA, and a more sophisticated interrupt controller. This course explicitly bridges the two worlds.
+If you completed the [Embedded Programming: ATmega328P](/education/embedded-programming-atmega328p/) course, the jump to STM32 will feel natural. The concepts are the same (GPIO, timers, UART, SPI, I2C), but the STM32 adds clock trees, DMA, and a more sophisticated interrupt controller. This course explicitly bridges the two worlds.
 :::
 
 <Copyright />

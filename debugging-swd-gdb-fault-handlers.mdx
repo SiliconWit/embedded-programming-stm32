@@ -1,0 +1,497 @@
+---
+title: "Debugging with SWD, GDB, and Fault Handlers"
+description: "Master STM32 debugging with SWD, GDB breakpoints, watchpoints, HardFault decoding, ITM trace, and register inspection. Find and fix five real bugs in pre-written firmware"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-02-26
+tags: ["stm32", "debugging", "swd", "gdb", "fault-handler", "hardfault", "itm"]
+excerpt: "Take on a bug hunt challenge: five subtle bugs are hidden in pre-written STM32 firmware. Use GDB with SWD to set breakpoints, inspect registers, decode HardFault exceptions, trace execution with ITM, and watch memory changes in real time. These are the debugging skills that separate frustrating hours from quick fixes."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+When embedded firmware misbehaves, you cannot just add print statements and re-run. The bug might be a stack overflow that corrupts memory silently, a HardFault triggered by a null pointer dereference, or a race condition between an interrupt and the main loop. The only reliable path to these bugs is a proper debugger. In this lesson you will set up GDB with OpenOCD over SWD, learn every debugging technique the Cortex-M3 offers, and then hunt down five real bugs planted in a firmware project. #STM32 #Debugging #GDB
+
+## What We Are Building
+
+<Card title="Bug Hunt Challenge: Find and Fix Five Bugs" icon="star">
+A pre-written firmware project with five intentionally planted bugs that cause various failure modes: a HardFault from an unaligned access, a stack overflow from unbounded recursion, a peripheral misconfiguration that silently drops data, a race condition between DMA and main loop code, and a watchdog timeout from a blocking loop. You will use GDB, SWD breakpoints, watchpoints, fault register decoding, and ITM trace to find and fix each one.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| Debugger | ST-Link V2 clone via SWD |
+| Debug software | GDB (gdb-multiarch or arm-none-eabi-gdb) + OpenOCD |
+| Bugs to find | 5 (described below, solutions at the end) |
+| New parts needed | None (reuse existing hardware) |
+| Skills practiced | Breakpoints, watchpoints, HardFault decode, ITM, register inspection |
+
+### The Five Bugs
+
+| Bug # | Symptom | Category |
+|-------|---------|----------|
+| 1 | Firmware crashes immediately after enabling a peripheral | HardFault (null pointer) |
+| 2 | Serial output works for 10 seconds then stops | Stack overflow |
+| 3 | ADC readings are always zero | Peripheral misconfiguration |
+| 4 | OLED display shows corrupted data occasionally | DMA race condition |
+| 5 | System resets every ~4 seconds | Watchdog timeout |
+
+## Setting Up GDB with OpenOCD
+
+<InArticleAd />
+
+
+### Starting OpenOCD
+
+OpenOCD acts as a bridge between GDB and the ST-Link hardware. It speaks USB to the ST-Link and GDB Remote Serial Protocol to GDB.
+
+```bash
+# Terminal 1: Start OpenOCD
+openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
+```
+
+OpenOCD listens on port 3333 for GDB connections and port 4444 for a telnet command interface.
+
+### Connecting GDB
+
+```bash
+# Terminal 2: Start GDB
+arm-none-eabi-gdb firmware.elf
+
+# Or if using gdb-multiarch (common on Ubuntu)
+gdb-multiarch firmware.elf
+```
+
+Inside GDB:
+
+```gdb
+# Connect to OpenOCD
+target remote localhost:3333
+
+# Load firmware into flash
+monitor reset halt
+load
+
+# Set a breakpoint at main
+break main
+
+# Start execution
+continue
+```
+
+### Essential GDB Commands
+
+| Command | Short | Description |
+|---------|-------|-------------|
+| `break main` | `b main` | Set breakpoint at function |
+| `break *0x08001234` | `b *0x08001234` | Breakpoint at address |
+| `continue` | `c` | Resume execution |
+| `step` | `s` | Step one source line (into functions) |
+| `next` | `n` | Step one source line (over functions) |
+| `stepi` | `si` | Step one instruction |
+| `print var` | `p var` | Print variable value |
+| `print/x var` | `p/x var` | Print in hexadecimal |
+| `info registers` | `i r` | Show all CPU registers |
+| `info breakpoints` | `i b` | List breakpoints |
+| `backtrace` | `bt` | Show call stack |
+| `watch var` | | Break when variable changes |
+| `x/16xw 0x20000000` | | Examine 16 words at address |
+| `monitor reset halt` | | Reset and halt the MCU |
+
+## Breakpoints and Watchpoints
+
+<InArticleAd />
+
+
+The Cortex-M3 has 6 hardware breakpoints and 4 hardware watchpoints built into the silicon. Hardware breakpoints work on flash memory (where your code lives) without modifying the code. Watchpoints trigger when a memory address is read or written, which is invaluable for finding out who is corrupting a variable. GDB can also set software breakpoints by inserting a special instruction (BKPT), but these only work in RAM.
+
+### Using Breakpoints
+
+```gdb
+# Break when entering uart_send_string
+break uart_send_string
+
+# Conditional breakpoint: only when adc_value > 3000
+break main.c:85 if adc_values[0] > 3000
+
+# Temporary breakpoint (deleted after first hit)
+tbreak process_command
+
+# Delete all breakpoints
+delete
+```
+
+### Using Watchpoints
+
+```gdb
+# Break when 'counter' variable is written
+watch counter
+
+# Break when 'counter' is read
+rwatch counter
+
+# Break when memory at specific address is written
+watch *(uint32_t*)0x20000100
+
+# Useful for finding who corrupts a specific variable
+watch stack_canary
+```
+
+### Examining Memory
+
+```gdb
+# Examine the stack (16 32-bit words at current SP)
+x/16xw $sp
+
+# Examine the vector table
+x/16xw 0x08000000
+
+# Examine a peripheral register (e.g., RCC->CR)
+x/xw 0x40021000
+
+# Examine a struct
+print *((GPIO_TypeDef*)0x40010800)
+```
+
+## HardFault Decoding
+
+<InArticleAd />
+
+
+When the Cortex-M3 encounters an error it cannot handle (invalid memory access, undefined instruction, divide by zero with the trap enabled), it triggers a HardFault exception. The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
+
+### HardFault Handler
+
+```c
+void HardFault_Handler(void) {
+    __asm volatile (
+        "TST   LR, #4          \n"  /* Check which stack was in use */
+        "ITE   EQ               \n"
+        "MRSEQ R0, MSP          \n"  /* Main stack pointer */
+        "MRSNE R0, PSP          \n"  /* Process stack pointer */
+        "B     hard_fault_handler_c \n"
+    );
+}
+
+void hard_fault_handler_c(uint32_t *stack_frame) {
+    volatile uint32_t r0  = stack_frame[0];
+    volatile uint32_t r1  = stack_frame[1];
+    volatile uint32_t r2  = stack_frame[2];
+    volatile uint32_t r3  = stack_frame[3];
+    volatile uint32_t r12 = stack_frame[4];
+    volatile uint32_t lr  = stack_frame[5];
+    volatile uint32_t pc  = stack_frame[6];  /* Faulting instruction */
+    volatile uint32_t psr = stack_frame[7];
+
+    /* Configurable Fault Status Register */
+    volatile uint32_t cfsr = SCB->CFSR;
+    volatile uint32_t hfsr = SCB->HFSR;
+    volatile uint32_t mmfar = SCB->MMFAR;  /* Memory fault address */
+    volatile uint32_t bfar = SCB->BFAR;    /* Bus fault address */
+
+    /* Suppress unused variable warnings */
+    (void)r0; (void)r1; (void)r2; (void)r3;
+    (void)r12; (void)lr; (void)psr;
+    (void)cfsr; (void)hfsr; (void)mmfar; (void)bfar;
+
+    /*
+     * In GDB, set a breakpoint here and examine:
+     *   print/x pc    -> address of faulting instruction
+     *   print/x lr    -> return address (caller)
+     *   print/x cfsr  -> fault type bits
+     *   info line *pc -> source file and line number
+     */
+
+    while (1);  /* Halt here for debugger */
+}
+```
+
+### CFSR Bit Decoding
+
+| Bit Range | Register | Key Bits |
+|-----------|----------|----------|
+| [7:0] | MMFSR (MemManage) | MMARVALID, DACCVIOL, IACCVIOL |
+| [15:8] | BFSR (BusFault) | BFARVALID, PRECISERR, IMPRECISERR |
+| [31:16] | UFSR (UsageFault) | UNDEFINSTR, INVSTATE, INVPC, UNALIGNED |
+
+### Debugging a HardFault in GDB
+
+```gdb
+# When the firmware hits the HardFault handler:
+break hard_fault_handler_c
+
+# After it breaks, examine the saved PC (faulting instruction)
+print/x stack_frame[6]
+
+# Look up which source line that address corresponds to
+info line *0x08001A3C
+
+# Examine the fault status registers
+print/x *(uint32_t*)0xE000ED28    # CFSR
+print/x *(uint32_t*)0xE000ED2C    # HFSR
+
+# Examine the faulting address (if MemManage or BusFault)
+print/x *(uint32_t*)0xE000ED34    # MMFAR
+print/x *(uint32_t*)0xE000ED38    # BFAR
+```
+
+## ITM Trace Output
+
+<InArticleAd />
+
+
+ITM (Instrumentation Trace Macrocell) is a hardware debug feature that sends data from the MCU to the debugger through the SWO (Serial Wire Output) pin. Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
+
+### ITM Printf
+
+```c
+/* Send a character via ITM stimulus port 0 */
+void itm_putc(char c) {
+    while (ITM->PORT[0].u32 == 0);  /* Wait until port is ready */
+    ITM->PORT[0].u8 = (uint8_t)c;
+}
+
+void itm_puts(const char *str) {
+    while (*str) {
+        itm_putc(*str++);
+    }
+}
+```
+
+### OpenOCD ITM Configuration
+
+```bash
+# In the OpenOCD telnet console (port 4444):
+# Enable SWO trace at 72 MHz core clock, 2 MHz SWO baud
+tpiu config internal /tmp/itm.fifo uart off 72000000 2000000
+
+# Enable stimulus port 0
+itm port 0 on
+```
+
+```bash
+# In a separate terminal, read the ITM output:
+cat /tmp/itm.fifo
+```
+
+## Bug Hunt: The Five Bugs
+
+<InArticleAd />
+
+
+Now apply everything above to find and fix five bugs in the challenge firmware. Here are hints for each bug, followed by solutions.
+
+### Bug 1: HardFault on Peripheral Enable
+
+**Symptom:** The firmware crashes immediately after calling `sensor_init()`.
+
+**Debugging approach:**
+<Steps>
+1. Set a breakpoint at `sensor_init()` and step through line by line.
+2. When the HardFault triggers, examine the saved PC register in the fault handler.
+3. Look up the source line with `info line *<PC>`.
+4. Check: is the code dereferencing a pointer? Is that pointer valid?
+</Steps>
+
+### Bug 2: Serial Output Stops After 10 Seconds
+
+**Symptom:** The serial terminal shows data for about 10 seconds, then output freezes. The MCU does not reset, it just hangs.
+
+**Debugging approach:**
+<Steps>
+1. Let the firmware run until output stops.
+2. Press Ctrl+C in GDB to halt the CPU.
+3. Run `backtrace` to see where the CPU is stuck.
+4. If the backtrace shows deep recursion or the SP is near the bottom of RAM, you have a stack overflow.
+5. Check for recursive functions or large local arrays.
+</Steps>
+
+### Bug 3: ADC Readings Always Zero
+
+**Symptom:** The ADC values displayed on serial are always 0 for all channels.
+
+**Debugging approach:**
+<Steps>
+1. Check if the ADC clock is enabled: `x/xw 0x40021018` (RCC->APB2ENR).
+2. Check if the ADC is powered on: `x/xw 0x40012408` (ADC1->CR2).
+3. Check the DMA buffer: `x/3hx &adc_values`.
+4. Compare the ADC configuration registers against the working code from Lesson 6.
+</Steps>
+
+### Bug 4: OLED Shows Corrupted Data
+
+**Symptom:** The OLED display usually looks correct but occasionally shows garbled pixels or shifted text.
+
+**Debugging approach:**
+<Steps>
+1. Set a watchpoint on the framebuffer: `watch framebuffer[0]`.
+2. Check if DMA and the main loop are both writing to the framebuffer simultaneously.
+3. Look for missing DMA completion checks before modifying the buffer.
+</Steps>
+
+### Bug 5: System Resets Every ~4 Seconds
+
+**Symptom:** The firmware runs for about 4 seconds, then resets. The reset cause register (RCC->CSR) shows a watchdog reset.
+
+**Debugging approach:**
+<Steps>
+1. Search the code for IWDG (Independent Watchdog) initialization.
+2. Check if the watchdog is being fed (refreshed) regularly.
+3. Look for blocking loops or long delays that prevent the watchdog refresh.
+</Steps>
+
+## Solutions
+
+<InArticleAd />
+
+
+:::caution[Try finding the bugs yourself first]
+The solutions below reveal the root cause and fix for each bug. The real learning happens when you use the debugger to find them yourself. Come back to these solutions only after you have spent time investigating each bug.
+:::
+
+### Bug 1 Solution: Null Pointer Dereference
+
+The `sensor_init()` function receives a pointer to a configuration struct, but the caller passes `NULL`:
+
+```c
+/* Bug: passing NULL */
+sensor_config_t *config = NULL;
+sensor_init(config);  /* Dereferences config->i2c_addr, causing HardFault */
+
+/* Fix: initialize the struct */
+sensor_config_t config = { .i2c_addr = 0x76, .oversample = 1 };
+sensor_init(&config);
+```
+
+### Bug 2 Solution: Unbounded Recursion
+
+A logging function calls itself recursively when the log buffer is full, instead of dropping the message:
+
+```c
+/* Bug: recursive call without base case */
+void log_message(const char *msg) {
+    if (log_buf_full()) {
+        log_flush();
+        log_message(msg);  /* Stack grows each time if flush fails */
+    }
+    /* ... */
+}
+
+/* Fix: use a loop instead of recursion */
+void log_message(const char *msg) {
+    if (log_buf_full()) {
+        log_flush();
+        if (log_buf_full()) return;  /* Drop message if still full */
+    }
+    /* ... */
+}
+```
+
+### Bug 3 Solution: Missing ADC Clock Enable
+
+The ADC clock enable line is commented out or uses the wrong register bit:
+
+```c
+/* Bug: enabling SPI1 clock instead of ADC1 */
+RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+
+/* Fix: enable ADC1 clock */
+RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+```
+
+### Bug 4 Solution: DMA Race Condition
+
+The main loop modifies the framebuffer while SPI DMA is still transmitting the previous frame:
+
+```c
+/* Bug: no synchronization */
+oled_clear();           /* Writes to framebuffer */
+draw_dashboard();       /* Writes to framebuffer */
+oled_update_dma();      /* Starts DMA transfer */
+/* Main loop immediately starts modifying framebuffer again */
+
+/* Fix: wait for DMA transfer to complete before modifying buffer */
+while (spi_dma_busy);   /* Wait for previous transfer */
+oled_clear();
+draw_dashboard();
+oled_update_dma();
+```
+
+### Bug 5 Solution: Blocking Loop Starves Watchdog
+
+A sensor read function has a blocking wait for a "data ready" flag that never gets set because the sensor was not properly configured:
+
+```c
+/* Bug: infinite wait if sensor not configured */
+while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08));  /* Wait for data ready */
+
+/* Fix: add timeout */
+uint32_t start = systick_ms;
+while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08)) {
+    if ((systick_ms - start) > 100) {
+        return SENSOR_TIMEOUT;  /* Bail out after 100 ms */
+    }
+    iwdg_feed();  /* Keep watchdog alive while waiting */
+}
+```
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 7 Complete" icon="approve-check">
+
+**GDB skills:**
+- Connecting GDB to OpenOCD for live debugging over SWD
+- Setting breakpoints (hardware and conditional) and watchpoints
+- Examining CPU registers, memory, and peripheral registers
+- Stepping through code at source and instruction level
+- Backtrace analysis for finding stuck or recursive code
+
+**Fault handling:**
+- HardFault handler that captures faulting PC and fault status registers
+- CFSR decoding to identify fault type (MemManage, BusFault, UsageFault)
+- Recovering the faulting instruction address and source line
+
+**ITM trace:**
+- Configuring SWO output through OpenOCD
+- Sending trace messages from firmware without using a UART peripheral
+
+**Bug hunting patterns:**
+- Null pointer dereferences causing HardFault
+- Stack overflow from unbounded recursion
+- Missing peripheral clock enable (the most common STM32 mistake)
+- DMA race conditions with shared buffers
+- Watchdog starvation from blocking waits without timeouts
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 8: FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32), you will bring multitasking to the Blue Pill. Sensor reading, display updates, and serial logging will each run as separate FreeRTOS tasks with proper synchronization through queues, semaphores, and mutexes.
+:::
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

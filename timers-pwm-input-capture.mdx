@@ -1,0 +1,413 @@
+---
+title: "Timers, PWM, and Input Capture"
+description: "Explore STM32 general-purpose and advanced timers to generate PWM, measure signals with input capture, and use the hardware encoder interface. Build a servo pan mechanism controlled by a rotary encoder"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-01-29
+tags: ["stm32", "timers", "pwm", "input-capture", "servo", "encoder"]
+excerpt: "Build a servo-driven pan mechanism controlled by a rotary encoder. Dive into the STM32 timer subsystem: general-purpose timers, advanced timers, PWM generation, output compare modes, input capture, and the hardware quadrature encoder interface that offloads counting from the CPU."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+Servos expect a very specific PWM signal: a pulse every 20 ms, with the pulse width encoding the target angle. Getting this right requires precise timer configuration, and the STM32 timer subsystem is one of the most capable (and complex) peripherals on the chip. In this lesson you will generate servo-grade PWM, read an encoder using the timer's built-in hardware encoder mode, and combine both into a smooth pan mechanism that tracks your finger on the knob. #STM32 #Timers #PWM
+
+## What We Are Building
+
+<Card title="Servo Pan Mechanism with Encoder Control" icon="star">
+A servo motor that pans left and right based on rotary encoder input. The encoder is read using TIM3's hardware encoder interface (no software polling needed), and the servo is driven by TIM2's PWM output. Rotating the encoder clockwise pans the servo right; counterclockwise pans it left. The position is displayed on the serial terminal along with the raw encoder count and servo pulse width.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| Servo | SG90 micro servo (or compatible) |
+| Servo PWM pin | PA0 (TIM2_CH1) |
+| PWM period | 20 ms (50 Hz) |
+| Pulse width range | 0.5 ms (0 degrees) to 2.5 ms (180 degrees) |
+| Encoder timer | TIM3 in encoder mode |
+| Encoder pins | PA6 (TIM3_CH1), PA7 (TIM3_CH2) |
+| Encoder button | PB5 (GPIO input, center/reset position) |
+| Serial output | USART1 on PA9 (115200 baud) |
+
+### Bill of Materials
+
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| Blue Pill (STM32F103C8T6) | 1 | From previous lessons |
+| ST-Link V2 clone | 1 | From previous lessons |
+| SG90 micro servo | 1 | 4.8-6V operating voltage |
+| KY-040 rotary encoder | 1 | From Lesson 2 |
+| Breadboard + jumper wires | 1 set | From previous lessons |
+| External 5V supply (optional) | 1 | For servo power if USB is insufficient |
+
+## STM32 Timer Overview
+
+<InArticleAd />
+
+
+The STM32F103 has seven timers, each with different capabilities. Understanding which timer to use for which task is essential for efficient peripheral allocation. All timers share a common counting core but differ in channel count, resolution, and special features.
+
+| Timer | Type | Channels | Resolution | Special Features |
+|-------|------|----------|------------|-----------------|
+| TIM1 | Advanced | 4 | 16-bit | Complementary outputs, dead-time, break input |
+| TIM2 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
+| TIM3 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
+| TIM4 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
+| TIM5 | General-purpose | 4 | 16-bit | (Not on all F103 variants) |
+| TIM6 | Basic | 0 | 16-bit | DAC trigger, timebase only |
+| TIM7 | Basic | 0 | 16-bit | DAC trigger, timebase only |
+
+### Timer Clock Source
+
+TIM2, TIM3, and TIM4 are on the APB1 bus, which runs at 36 MHz. However, when the APB1 prescaler is greater than 1 (which it is, since we divide by 2 to get 36 MHz from 72 MHz), the timer clock is automatically doubled to 72 MHz. This means all general-purpose timers run at 72 MHz despite being on the 36 MHz APB1 bus. TIM1, being on APB2, also runs at 72 MHz directly.
+
+### Timer Counting Modes
+
+```
+Up-counting:    0 -> 1 -> 2 -> ... -> ARR -> 0 -> 1 -> ...
+Down-counting:  ARR -> ARR-1 -> ... -> 0 -> ARR -> ARR-1 -> ...
+Center-aligned: 0 -> 1 -> ... -> ARR -> ARR-1 -> ... -> 0 -> 1 -> ...
+```
+
+## Servo PWM Generation (TIM2)
+
+<InArticleAd />
+
+
+A standard hobby servo expects a PWM signal with a 20 ms period (50 Hz). The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
+
+### PWM Configuration
+
+```c
+void servo_pwm_init(void) {
+    /* Enable clocks for GPIOA and TIM2 */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+
+    /* PA0 as alternate function push-pull, 50 MHz */
+    GPIOA->CRL &= ~(0xF << 0);
+    GPIOA->CRL |=  (0xB << 0);
+
+    /*
+     * Timer clock = 72 MHz
+     * PSC = 72 - 1 = 71   -> counter clock = 1 MHz (1 us per tick)
+     * ARR = 20000 - 1      -> period = 20 ms (50 Hz)
+     *
+     * CCR1 = 500   -> 0.5 ms pulse -> 0 degrees
+     * CCR1 = 1500  -> 1.5 ms pulse -> 90 degrees
+     * CCR1 = 2500  -> 2.5 ms pulse -> 180 degrees
+     */
+    TIM2->PSC = 72 - 1;
+    TIM2->ARR = 20000 - 1;
+    TIM2->CCR1 = 1500;         /* Start at center (90 degrees) */
+
+    /* PWM mode 1 on channel 1, preload enable */
+    TIM2->CCMR1 &= ~TIM_CCMR1_OC1M;
+    TIM2->CCMR1 |= (0x6 << 4);   /* PWM mode 1 */
+    TIM2->CCMR1 |= TIM_CCMR1_OC1PE;  /* Preload enable */
+
+    TIM2->CCER |= TIM_CCER_CC1E;  /* Enable channel 1 output */
+    TIM2->CR1 |= TIM_CR1_ARPE;    /* Auto-reload preload */
+    TIM2->EGR |= TIM_EGR_UG;      /* Force update to load preload values */
+    TIM2->CR1 |= TIM_CR1_CEN;     /* Start timer */
+}
+
+void servo_set_angle(uint16_t angle_degrees) {
+    if (angle_degrees > 180) angle_degrees = 180;
+
+    /* Map 0-180 degrees to 500-2500 us pulse width */
+    uint16_t pulse_us = 500 + (angle_degrees * 2000) / 180;
+    TIM2->CCR1 = pulse_us;
+}
+```
+
+### PWM Output Compare Modes
+
+The STM32 timers support several output compare modes beyond basic PWM:
+
+| Mode | OC1M bits | Behavior |
+|------|-----------|----------|
+| Frozen | 000 | Output unaffected by comparison |
+| Active on match | 001 | Set output high on match |
+| Inactive on match | 010 | Set output low on match |
+| Toggle | 011 | Toggle output on match |
+| Force low | 100 | Force output low |
+| Force high | 101 | Force output high |
+| PWM mode 1 | 110 | High when counter < CCR, low otherwise |
+| PWM mode 2 | 111 | Low when counter < CCR, high otherwise |
+
+## Hardware Encoder Interface (TIM3)
+
+<InArticleAd />
+
+
+In Lesson 2 we read the encoder in software by polling GPIO pins. The STM32 timers offer a much better approach: encoder mode. In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
+
+### Encoder Mode Configuration
+
+```c
+void encoder_hw_init(void) {
+    /* Enable clocks for GPIOA and TIM3 */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+
+    /* PA6 (TIM3_CH1) and PA7 (TIM3_CH2) as input floating */
+    GPIOA->CRL &= ~((0xF << 24) | (0xF << 28));
+    GPIOA->CRL |=  ((0x4 << 24) | (0x4 << 28));
+
+    /*
+     * Encoder mode 3: count on both TI1 and TI2 edges
+     * This gives 4x resolution (4 counts per detent on KY-040)
+     *
+     * SMS = 011 (encoder mode 3)
+     * CC1S = 01 (IC1 mapped to TI1)
+     * CC2S = 01 (IC2 mapped to TI2)
+     */
+    TIM3->SMCR &= ~TIM_SMCR_SMS;
+    TIM3->SMCR |= TIM_SMCR_SMS_0 | TIM_SMCR_SMS_1;  /* Encoder mode 3 */
+
+    TIM3->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
+    TIM3->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0;
+
+    /* Input filter: 4 samples at fDTS/2 (debouncing) */
+    TIM3->CCMR1 |= (0x3 << 4) | (0x3 << 12);
+
+    /* Set auto-reload to maximum for free-running counter */
+    TIM3->ARR = 0xFFFF;
+
+    /* Start at midpoint so we can detect both directions */
+    TIM3->CNT = 32768;
+
+    /* Enable the timer */
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+int16_t encoder_hw_read(void) {
+    return (int16_t)(TIM3->CNT - 32768);
+}
+```
+
+### Encoder Mode Comparison
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Software polling (Lesson 2) | Simple, any GPIO pin | Misses steps under load, uses CPU |
+| Hardware encoder mode | Zero CPU usage, never misses steps | Requires specific timer pins |
+| External interrupt (EXTI) | Works on any EXTI pin | Interrupt overhead, possible missed edges |
+
+## Input Capture
+
+<InArticleAd />
+
+
+Input capture records the timer counter value at the moment an external signal edge occurs. This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
+
+### Measuring a Signal Period
+
+```c
+volatile uint32_t capture_value = 0;
+volatile uint32_t last_capture = 0;
+volatile uint32_t period_ticks = 0;
+
+void input_capture_init(void) {
+    /* TIM4 CH1 on PB6 as input capture */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM4EN;
+
+    /* PB6 as input floating */
+    GPIOB->CRL &= ~(0xF << 24);
+    GPIOB->CRL |=  (0x4 << 24);
+
+    /* TIM4 prescaler: 72 MHz / 72 = 1 MHz (1 us resolution) */
+    TIM4->PSC = 72 - 1;
+    TIM4->ARR = 0xFFFF;
+
+    /* CC1 as input, mapped to TI1, rising edge, no filter */
+    TIM4->CCMR1 &= ~TIM_CCMR1_CC1S;
+    TIM4->CCMR1 |= TIM_CCMR1_CC1S_0;    /* IC1 mapped to TI1 */
+
+    TIM4->CCER &= ~TIM_CCER_CC1P;        /* Rising edge */
+    TIM4->CCER |= TIM_CCER_CC1E;         /* Enable capture */
+
+    /* Enable capture interrupt */
+    TIM4->DIER |= TIM_DIER_CC1IE;
+    NVIC_EnableIRQ(TIM4_IRQn);
+
+    TIM4->CR1 |= TIM_CR1_CEN;
+}
+
+void TIM4_IRQHandler(void) {
+    if (TIM4->SR & TIM_SR_CC1IF) {
+        TIM4->SR &= ~TIM_SR_CC1IF;
+
+        capture_value = TIM4->CCR1;
+        period_ticks = capture_value - last_capture;
+        last_capture = capture_value;
+    }
+}
+```
+
+## Putting It Together: Servo Pan with Encoder
+
+<InArticleAd />
+
+
+### Main Application
+
+```c
+#include "stm32f103xb.h"
+#include <string.h>
+
+/* Forward declarations (implementations from above) */
+void clock_init(void);
+void systick_init(void);
+void uart_init(void);
+void uart_send_string(const char *str);
+void servo_pwm_init(void);
+void servo_set_angle(uint16_t angle);
+void encoder_hw_init(void);
+int16_t encoder_hw_read(void);
+
+/* Simple integer-to-string conversion */
+void itoa_simple(int32_t val, char *buf) {
+    if (val < 0) { *buf++ = '-'; val = -val; }
+    char tmp[12];
+    int i = 0;
+    do { tmp[i++] = '0' + (val % 10); val /= 10; } while (val);
+    while (i > 0) *buf++ = tmp[--i];
+    *buf = '\0';
+}
+
+int main(void) {
+    clock_init();
+    systick_init();
+    uart_init();
+    servo_pwm_init();
+    encoder_hw_init();
+
+    /* PB5 as input pull-up for encoder button */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    GPIOB->CRL &= ~(0xF << 20);
+    GPIOB->CRL |=  (0x8 << 20);
+    GPIOB->ODR |=  (1 << 5);
+
+    int16_t last_encoder = 0;
+    uint16_t servo_angle = 90;  /* Start centered */
+    char buf[32];
+
+    uart_send_string("Servo Pan Controller Ready\r\n");
+    uart_send_string("Rotate encoder to pan, press to center.\r\n\r\n");
+
+    while (1) {
+        int16_t enc_pos = encoder_hw_read();
+        int16_t delta = enc_pos - last_encoder;
+
+        if (delta != 0) {
+            last_encoder = enc_pos;
+
+            /* Each encoder step moves servo by 2 degrees */
+            int16_t new_angle = (int16_t)servo_angle + (delta * 2);
+            if (new_angle < 0) new_angle = 0;
+            if (new_angle > 180) new_angle = 180;
+            servo_angle = (uint16_t)new_angle;
+
+            servo_set_angle(servo_angle);
+
+            /* Print status */
+            uart_send_string("Angle: ");
+            itoa_simple(servo_angle, buf);
+            uart_send_string(buf);
+            uart_send_string(" deg  |  Pulse: ");
+            itoa_simple(500 + (servo_angle * 2000) / 180, buf);
+            uart_send_string(buf);
+            uart_send_string(" us  |  Encoder: ");
+            itoa_simple(enc_pos, buf);
+            uart_send_string(buf);
+            uart_send_string("\r\n");
+        }
+
+        /* Button press: return to center */
+        if (!(GPIOB->IDR & (1 << 5))) {
+            servo_angle = 90;
+            servo_set_angle(90);
+            uart_send_string(">> Centered at 90 degrees\r\n");
+            /* Simple debounce delay */
+            for (volatile uint32_t i = 0; i < 200000; i++);
+        }
+    }
+}
+```
+
+### Wiring Summary
+
+| Connection | Wire |
+|------------|------|
+| PA0 (TIM2_CH1) | Servo signal (orange/yellow wire) |
+| PA6 (TIM3_CH1) | Encoder CLK |
+| PA7 (TIM3_CH2) | Encoder DT |
+| PB5 | Encoder SW (button) |
+| PA9 (USART1_TX) | Serial terminal RX |
+| 5V | Servo power (red wire) |
+| 3.3V | Encoder VCC |
+| GND | Common ground (servo, encoder, serial) |
+
+:::caution[Servo power]
+The SG90 draws up to 500 mA under load. USB power from the Blue Pill may be insufficient, especially if the servo stalls. For reliable operation, power the servo from a separate 5V supply with its ground connected to the Blue Pill's ground.
+:::
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 3 Complete" icon="approve-check">
+
+**Timer knowledge:**
+- STM32 timer types (advanced, general-purpose, basic) and their capabilities
+- Timer clock source derivation from APB buses with automatic doubling
+- Counting modes (up, down, center-aligned)
+
+**PWM skills:**
+- Configured 50 Hz servo PWM with microsecond-level pulse width control
+- Output compare modes and when to use each
+- Preload registers and update events for glitch-free PWM changes
+
+**Input capture skills:**
+- Timer input capture for measuring signal periods and pulse widths
+- Capture interrupt handling in the IRQ handler
+
+**Encoder interface:**
+- Hardware encoder mode that counts quadrature signals without CPU intervention
+- Input filtering for debouncing mechanical encoders
+- Comparison of software polling vs. hardware encoder mode
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 4: UART with DMA and Interrupts](/education/embedded-programming-stm32/uart-dma-interrupts), you will build an interactive command shell that can set PWM values, read pins, and dump registers over serial. You will learn NVIC priorities, DMA channels, circular buffers, and idle line detection for efficient serial communication.
+:::
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />

@@ -1,0 +1,436 @@
+---
+title: "STM32 Toolchain and ARM Cortex-M Architecture"
+description: "Set up the complete STM32 development toolchain with arm-gcc, OpenOCD, and STM32CubeMX. Explore the ARM Cortex-M3 architecture, vector table, startup code, and linker scripts while building a breathing LED on the Blue Pill board"
+contributors: "sam-macharia,lawrence-langat"
+pubDate: 2026-01-15
+tags: ["stm32", "arm", "cortex-m", "toolchain", "openocd", "cubemx", "blue-pill"]
+excerpt: "Install arm-gcc, OpenOCD, and STM32CubeMX, then build a breathing LED project on the Blue Pill (STM32F103C8T6). Walk through the Cortex-M3 vector table, startup code, linker scripts, and CMSIS to understand what happens before main() runs."
+heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/STM32F4-BlackPill-Pinout.jpg"
+---
+
+import TawkWidget from '../../../../components/TawkWidget.astro';
+import UniversalContentContributors from '../../../../components/UniversalContentContributors.astro';
+import InArticleAd from '../../../../components/InArticleAd.astro';
+import Copyright from '../../../../components/Copyright.astro';
+import BionicText from '../../../../components/BionicText.astro';
+import TailwindWrapper from '../../../../components/TailwindWrapper.jsx';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/starlight/components';
+
+<UniversalContentContributors 
+  contributors={frontmatter.contributors}
+/>
+
+
+
+import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
+
+Most STM32 tutorials jump straight into HAL-generated code, skipping everything that happens before `main()` runs. In this lesson, you will install the complete ARM toolchain from scratch, flash a breathing LED onto the Blue Pill board, and trace the entire boot sequence from the vector table through startup assembly to your C code. Understanding these foundations makes every future debugging session faster and every peripheral configuration clearer. #STM32 #ARM #Toolchain
+
+## What We Are Building
+
+<Card title="Breathing LED with HSE Clock and Timer PWM" icon="star">
+A smooth breathing LED that ramps brightness up and down using hardware PWM driven by a general-purpose timer. The HSE crystal provides an accurate 72 MHz system clock through the PLL, and the timer generates a PWM signal that sweeps duty cycle from 0% to 100% and back. No blocking delays; the LED breathes entirely in hardware while the CPU is free.
+</Card>
+
+**Project specifications:**
+
+| Parameter | Value |
+|-----------|-------|
+| Board | Blue Pill (STM32F103C8T6) |
+| Programmer | ST-Link V2 clone |
+| Clock source | 8 MHz HSE crystal, PLL x9 = 72 MHz |
+| Timer | TIM2 CH1, PWM mode 1 |
+| LED pin | PA0 (TIM2_CH1 alternate function) |
+| PWM frequency | 1 kHz |
+| Breathing cycle | ~2 seconds (ramp up + ramp down) |
+| Toolchain | arm-none-eabi-gcc, OpenOCD, make |
+
+### Bill of Materials
+
+| Component | Quantity | Notes |
+|-----------|----------|-------|
+| Blue Pill (STM32F103C8T6) | 1 | The classic $2 development board |
+| ST-Link V2 clone | 1 | SWD programmer/debugger |
+| Breadboard | 1 | Full-size or half-size |
+| LED (any color, 3mm or 5mm) | 1 | External LED on PA0 |
+| 330 ohm resistor | 1 | Current limiting for LED |
+| Jumper wires | 4+ | For connections |
+
+## Installing the ARM Toolchain
+
+<InArticleAd />
+
+
+<Tabs>
+<TabItem label="Linux (Ubuntu/Debian)">
+```bash
+# ARM GCC cross-compiler
+sudo apt update
+sudo apt install gcc-arm-none-eabi gdb-multiarch
+
+# OpenOCD for flashing and debugging
+sudo apt install openocd
+
+# STM32CubeMX (download from ST website)
+# https://www.st.com/en/development-tools/stm32cubemx.html
+# Requires Java runtime; the installer handles this on most systems
+
+# Verify installation
+arm-none-eabi-gcc --version
+openocd --version
+```
+</TabItem>
+<TabItem label="macOS">
+```bash
+# Using Homebrew
+brew install arm-none-eabi-gcc
+brew install open-ocd
+
+# Verify
+arm-none-eabi-gcc --version
+openocd --version
+
+# STM32CubeMX: download the macOS installer from
+# https://www.st.com/en/development-tools/stm32cubemx.html
+```
+</TabItem>
+<TabItem label="Windows">
+```
+1. Download ARM GNU Toolchain from:
+   https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads
+   Install and add to PATH.
+
+2. Download OpenOCD from:
+   https://github.com/openocd-org/openocd/releases
+   Extract and add the bin/ folder to PATH.
+
+3. Download STM32CubeMX from:
+   https://www.st.com/en/development-tools/stm32cubemx.html
+
+4. Verify in Command Prompt:
+   arm-none-eabi-gcc --version
+   openocd --version
+```
+</TabItem>
+</Tabs>
+
+### Connecting the ST-Link to the Blue Pill
+
+The ST-Link V2 connects to the Blue Pill through the SWD (Serial Wire Debug) interface. Four wires are all you need: SWDIO, SWCLK, GND, and 3.3V. The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
+
+| ST-Link Pin | Blue Pill Pin |
+|-------------|---------------|
+| SWDIO | SWDIO (DIO) |
+| SWCLK | SWCLK (CLK) |
+| GND | GND |
+| 3.3V | 3.3V |
+
+Test the connection:
+
+```bash
+openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
+```
+
+You should see output ending with something like `Info : stm32f1x.cpu: hardware has 6 breakpoints, 4 watchpoints`. Press `Ctrl+C` to exit.
+
+## ARM Cortex-M3 Architecture Overview
+
+<InArticleAd />
+
+
+The STM32F103 is built around the ARM Cortex-M3 core. Unlike application processors (Cortex-A), the Cortex-M series is designed specifically for microcontrollers: deterministic interrupt latency, a built-in NVIC (Nested Vectored Interrupt Controller), Thumb-2 instruction set only, and hardware-assisted exception handling. Understanding a few key architectural concepts will help you write better firmware and debug problems more effectively.
+
+### Memory Map
+
+The Cortex-M3 uses a fixed 4 GB address space divided into well-defined regions:
+
+| Address Range | Region | STM32F103 Usage |
+|---------------|--------|-----------------|
+| 0x0000_0000 - 0x1FFF_FFFF | Code | Flash (aliased from 0x0800_0000) |
+| 0x2000_0000 - 0x3FFF_FFFF | SRAM | 20 KB SRAM |
+| 0x4000_0000 - 0x5FFF_FFFF | Peripherals | GPIO, UART, SPI, timers, etc. |
+| 0xE000_0000 - 0xE00F_FFFF | System | NVIC, SysTick, debug registers |
+
+### Vector Table
+
+The very first thing the Cortex-M3 reads after reset is the vector table, stored at address 0x0000_0000 (which maps to the start of flash at 0x0800_0000). The first entry is the initial stack pointer value. The second entry is the reset handler address. The remaining entries are exception and interrupt handler addresses.
+
+```c
+/* Simplified vector table structure */
+uint32_t vector_table[] = {
+    (uint32_t)&_estack,        /* Initial stack pointer */
+    (uint32_t)Reset_Handler,   /* Reset handler */
+    (uint32_t)NMI_Handler,     /* Non-maskable interrupt */
+    (uint32_t)HardFault_Handler, /* Hard fault */
+    /* ... more exception handlers ... */
+    (uint32_t)TIM2_IRQHandler, /* TIM2 global interrupt */
+    /* ... more peripheral interrupts ... */
+};
+```
+
+### Startup Code
+
+The startup code runs before main(). It copies initialized data from flash to SRAM (the .data section), zeros out uninitialized global variables (the .bss section), calls any C++ constructors (if applicable), sets up the FPU (on Cortex-M4F), and finally calls main(). On the STM32F103, CMSIS provides SystemInit() which configures the clock tree before main() begins.
+
+### Linker Script
+
+The linker script tells the toolchain where to place code and data in memory:
+
+```ld
+/* Minimal STM32F103C8T6 linker script excerpt */
+MEMORY
+{
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 64K
+    RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 20K
+}
+
+SECTIONS
+{
+    .isr_vector : {
+        KEEP(*(.isr_vector))
+    } > FLASH
+
+    .text : {
+        *(.text*)
+        *(.rodata*)
+    } > FLASH
+
+    .data : {
+        _sdata = .;
+        *(.data*)
+        _edata = .;
+    } > RAM AT > FLASH
+
+    .bss : {
+        _sbss = .;
+        *(.bss*)
+        _ebss = .;
+    } > RAM
+}
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+```
+
+## Building the Breathing LED
+
+<InArticleAd />
+
+
+### Project Structure
+
+<FileTree>
+- breathing-led/
+  - src/
+    - main.c
+    - startup_stm32f103.s
+    - system_stm32f1xx.c
+  - include/
+    - stm32f103xb.h
+    - system_stm32f1xx.h
+  - STM32F103C8Tx_FLASH.ld
+  - Makefile
+  - openocd.cfg
+</FileTree>
+
+### Clock Configuration (HSE + PLL = 72 MHz)
+
+The Blue Pill has an 8 MHz crystal connected to the HSE pins. We configure the PLL to multiply this by 9, giving us a 72 MHz system clock. The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
+
+```c
+void clock_init(void) {
+    /* Enable HSE (external 8 MHz crystal) */
+    RCC->CR |= RCC_CR_HSEON;
+    while (!(RCC->CR & RCC_CR_HSERDY));
+
+    /* Configure flash latency for 72 MHz (2 wait states) */
+    FLASH->ACR |= FLASH_ACR_LATENCY_2;
+
+    /* Configure PLL: HSE as source, multiply by 9 = 72 MHz */
+    RCC->CFGR |= RCC_CFGR_PLLSRC;       /* HSE as PLL source */
+    RCC->CFGR |= RCC_CFGR_PLLMULL9;     /* PLL x9 */
+
+    /* AHB prescaler = 1, APB1 prescaler = 2, APB2 prescaler = 1 */
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2;
+
+    /* Enable PLL and wait for it to lock */
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY));
+
+    /* Switch system clock to PLL */
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
+}
+```
+
+### Timer PWM Setup
+
+```c
+void pwm_init(void) {
+    /* Enable GPIOA and TIM2 clocks */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+
+    /* PA0 as alternate function push-pull output */
+    GPIOA->CRL &= ~(0xF << 0);
+    GPIOA->CRL |= (0xB << 0);  /* AF push-pull, 50 MHz */
+
+    /* TIM2 configuration: 1 kHz PWM */
+    TIM2->PSC = 72 - 1;       /* 72 MHz / 72 = 1 MHz timer clock */
+    TIM2->ARR = 1000 - 1;     /* 1 MHz / 1000 = 1 kHz PWM */
+    TIM2->CCR1 = 0;           /* Start with 0% duty cycle */
+
+    /* PWM mode 1 on channel 1, preload enable */
+    TIM2->CCMR1 |= (0x6 << 4) | TIM_CCMR1_OC1PE;
+    TIM2->CCER |= TIM_CCER_CC1E;  /* Enable CH1 output */
+    TIM2->CR1 |= TIM_CR1_CEN;     /* Start timer */
+}
+```
+
+### Main Loop (Breathing Effect)
+
+```c
+#include "stm32f103xb.h"
+
+void clock_init(void);
+void pwm_init(void);
+
+int main(void) {
+    clock_init();
+    pwm_init();
+
+    uint16_t brightness = 0;
+    int8_t direction = 1;
+    uint32_t step_delay = 2000;  /* Adjust for breathing speed */
+
+    while (1) {
+        TIM2->CCR1 = brightness;
+
+        brightness += direction;
+        if (brightness >= 999) {
+            direction = -1;
+        } else if (brightness == 0) {
+            direction = 1;
+        }
+
+        /* Simple delay (will replace with SysTick in later lessons) */
+        for (volatile uint32_t i = 0; i < step_delay; i++);
+    }
+}
+```
+
+### Makefile
+
+```makefile
+TARGET = breathing-led
+CC = arm-none-eabi-gcc
+OBJCOPY = arm-none-eabi-objcopy
+
+CFLAGS = -mcpu=cortex-m3 -mthumb -Os -Wall -g
+CFLAGS += -DSTM32F103xB
+CFLAGS += -Iinclude
+
+LDFLAGS = -T STM32F103C8Tx_FLASH.ld -nostdlib -lc -lgcc
+
+SRCS = src/main.c src/system_stm32f1xx.c src/startup_stm32f103.s
+
+all: $(TARGET).bin
+
+$(TARGET).elf: $(SRCS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+$(TARGET).bin: $(TARGET).elf
+	$(OBJCOPY) -O binary $< $@
+
+flash: $(TARGET).bin
+	openocd -f openocd.cfg -c "program $< 0x08000000 verify reset exit"
+
+clean:
+	rm -f $(TARGET).elf $(TARGET).bin
+
+.PHONY: all flash clean
+```
+
+### OpenOCD Configuration
+
+```bash
+# openocd.cfg
+source [find interface/stlink.cfg]
+source [find target/stm32f1x.cfg]
+```
+
+### Build and Flash
+
+```bash
+make
+make flash
+```
+
+The LED on PA0 should now smoothly ramp up and down in brightness. If you see it blinking instead of breathing, check that the PWM output pin (PA0) is correctly wired and that the timer configuration matches the code above.
+
+## Exploring with STM32CubeMX
+
+<InArticleAd />
+
+
+STM32CubeMX is ST's graphical configuration tool. It generates initialization code for clocks, peripherals, and pin assignments. While we wrote bare-register code above, CubeMX is invaluable for quickly checking pin alternate functions, visualizing the clock tree, and generating a starting point for complex configurations.
+
+<Steps>
+1. Open STM32CubeMX and create a new project for STM32F103C8T6.
+
+2. Click the **Clock Configuration** tab. Set HSE to 8 MHz, enable PLL, set the multiplier to x9, and verify the system clock shows 72 MHz. Notice how APB1 is limited to 36 MHz.
+
+3. Back in the **Pinout** tab, click PA0 and set it to TIM2_CH1. Notice the pin turns green, indicating a valid alternate function assignment.
+
+4. Under **Timers > TIM2**, set Channel 1 to "PWM Generation CH1". Set the prescaler and auto-reload values to match our 1 kHz PWM configuration.
+
+5. Click **Generate Code** to see the HAL-based equivalent. Compare the generated `MX_TIM2_Init()` function with our register-level code above. The registers being written are the same; HAL wraps them in structures and error checking.
+</Steps>
+
+## CMSIS and Device Headers
+
+<InArticleAd />
+
+
+CMSIS (Cortex Microcontroller Software Interface Standard) provides a standardized way to access Cortex-M core registers and peripherals. The device header file (stm32f103xb.h) defines register addresses, bit field masks, and peripheral structures so you can write `TIM2->CCR1` instead of `*(volatile uint32_t*)0x40000034`. Every STM32 project uses these headers, whether you write bare-register code or use HAL.
+
+You can get the CMSIS and device headers from two sources:
+
+- **STM32CubeF1 package:** Download from ST's website or clone `https://github.com/STMicroelectronics/STM32CubeF1`. The headers are in `Drivers/CMSIS/Device/ST/STM32F1xx/Include/`.
+- **Generated by CubeMX:** When you generate code, CubeMX copies the necessary headers into your project.
+
+## What You Have Learned
+
+<InArticleAd />
+
+
+<Card title="Lesson 1 Complete" icon="approve-check">
+
+**Toolchain skills:**
+- Installed arm-none-eabi-gcc, OpenOCD, and STM32CubeMX
+- Connected ST-Link V2 to the Blue Pill via SWD
+- Built and flashed firmware from the command line
+
+**Architecture knowledge:**
+- Cortex-M3 memory map and fixed address regions
+- Vector table structure (initial SP, reset handler, interrupt handlers)
+- Startup code responsibilities (copy .data, zero .bss, call main)
+- Linker script sections and memory placement
+
+**Peripheral skills:**
+- Configured HSE crystal and PLL for 72 MHz system clock
+- Set up TIM2 in PWM mode with prescaler and auto-reload
+- Generated a breathing LED effect using hardware PWM
+</Card>
+
+:::tip[Next Lesson]
+In [Lesson 2: GPIO and Clock Tree Configuration](/education/embedded-programming-stm32/gpio-clock-tree-configuration), you will build a rotary encoder menu system. You will explore the full RCC clock tree, AHB/APB bus architecture, and all four GPIO modes with their alternate functions.
+:::
+
+<EmbeddedProgrammingStm32Comments />
+
+
+
+<InArticleAd />
+<TawkWidget />
+<Copyright />
