@@ -82,7 +82,9 @@ The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus (72 MHz max) and SPI
 
   DC pin: LOW = command, HIGH = data
   CS pin: LOW = selected (active)
-``` SPI1 can run at up to 18 MHz in master mode (72 MHz / 4), which is plenty fast for driving OLED displays. SPI is a synchronous, full-duplex protocol with four signals: SCK (clock), MOSI (master out, slave in), MISO (master in, slave out), and CS (chip select, active low).
+```
+
+SPI1 can run at up to 18 MHz in master mode (72 MHz / 4), which is plenty fast for driving OLED displays. SPI is a synchronous, full-duplex protocol with four signals: SCK (clock), MOSI (master out, slave in), MISO (master in, slave out), and CS (chip select, active low).
 
 ### SPI Configuration Registers
 

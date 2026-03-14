@@ -222,7 +222,9 @@ The analog watchdog is a hardware feature that compares every ADC conversion res
         range       exceeded:
                     AWD interrupt
                     fires instantly
-``` When a conversion falls outside the allowed range, it sets a flag and optionally triggers an interrupt. This happens in hardware at ADC speed, so your firmware is notified within one conversion cycle (about 20 us at 12 MHz). Compare this to polling the ADC value in software, which depends on your loop speed and could miss brief spikes entirely.
+```
+
+When a conversion falls outside the allowed range, it sets a flag and optionally triggers an interrupt. This happens in hardware at ADC speed, so your firmware is notified within one conversion cycle (about 20 us at 12 MHz). Compare this to polling the ADC value in software, which depends on your loop speed and could miss brief spikes entirely.
 
 ### Watchdog Configuration
 
@@ -311,7 +313,9 @@ The INA219 is a high-side current and power monitor with an I2C interface. It me
   Current = V_shunt / R_shunt
   INA219 does this calculation
   internally and returns mA over I2C.
-``` It measures the voltage drop across a shunt resistor to calculate current, and it also measures the bus voltage. Most INA219 breakout boards include a 0.1 ohm shunt resistor, giving a maximum measurement range of about 3.2A. The INA219 has a built-in 12-bit ADC, so it returns calibrated current and power values directly over I2C.
+```
+
+It measures the voltage drop across a shunt resistor to calculate current, and it also measures the bus voltage. Most INA219 breakout boards include a 0.1 ohm shunt resistor, giving a maximum measurement range of about 3.2A. The INA219 has a built-in 12-bit ADC, so it returns calibrated current and power values directly over I2C.
 
 ### INA219 Driver
 

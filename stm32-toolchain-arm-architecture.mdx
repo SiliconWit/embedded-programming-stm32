@@ -135,7 +135,9 @@ The ST-Link V2 connects to the Blue Pill through the SWD (Serial Wire Debug) int
 
   SWDIO: bidirectional data
   SWCLK: clock from ST-Link
-``` The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
+```
+
+The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
 
 | ST-Link Pin | Blue Pill Pin |
 |-------------|---------------|
@@ -297,7 +299,9 @@ The Blue Pill has an 8 MHz crystal connected to the HSE pins. We configure the P
                     (GPIO,    (TIM2-4,
                      SPI1,     I2C,
                      USART1)   USART2)
-``` The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
+```
+
+The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
 
 ```c
 void clock_init(void) {

@@ -113,7 +113,9 @@ A standard hobby servo expects a PWM signal with a 20 ms period (50 Hz). The pul
             |         |                   |
   __________| 2.5ms     |________________| 2.5
             |<------->|
-``` The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
+```
+
+The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
 
 ### PWM Configuration
 
@@ -203,7 +205,9 @@ In Lesson 2 we read the encoder in software by polling GPIO pins. The STM32 time
 
   CPU reads TIM3->CNT for position.
   Zero CPU overhead during counting.
-``` In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
+```
+
+In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
 
 ### Encoder Mode Configuration
 
@@ -278,7 +282,9 @@ Input capture records the timer counter value at the moment an external signal e
          = 6000 - 1000 = 5000 ticks
   At 1 MHz timer clock: 5000 us = 5 ms
   Frequency = 1 / 0.005 = 200 Hz
-``` This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
+```
+
+This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
 
 ### Measuring a Signal Period
 

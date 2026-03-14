@@ -134,7 +134,9 @@ DMA (Direct Memory Access) transfers data between peripherals and memory without
 
   In circular mode, CNDTR reloads
   automatically and CMAR wraps to start.
-``` The CPU sets up the transfer (source address, destination address, byte count, direction) and the DMA controller handles the rest. On the STM32F103, DMA1 has 7 channels, each hardwired to specific peripheral requests. You cannot freely assign any peripheral to any channel.
+```
+
+The CPU sets up the transfer (source address, destination address, byte count, direction) and the DMA controller handles the rest. On the STM32F103, DMA1 has 7 channels, each hardwired to specific peripheral requests. You cannot freely assign any peripheral to any channel.
 
 ### DMA1 Channel Assignments (Relevant Channels)
 
@@ -255,7 +257,9 @@ The UART idle line interrupt fires when the RX line has been idle for one frame 
     ^                   ^
     read_pos         write_pos
                      (= 256 - CNDTR)
-``` This is the perfect trigger for "a complete message has arrived" because most serial terminals send commands as a burst of characters followed by silence. You do not need to poll or wait for a specific delimiter; the idle interrupt tells you when the sender has stopped transmitting.
+```
+
+This is the perfect trigger for "a complete message has arrived" because most serial terminals send commands as a burst of characters followed by silence. You do not need to poll or wait for a specific delimiter; the idle interrupt tells you when the sender has stopped transmitting.
 
 ```c
 volatile uint8_t rx_data_ready = 0;

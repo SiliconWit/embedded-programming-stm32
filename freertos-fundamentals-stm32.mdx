@@ -231,7 +231,9 @@ Queues are the primary way to pass data between tasks. Data flows from producers
   Sensor sends every 500 ms.
   Display and Logger consume data.
   Queue blocks consumers when empty.
-``` They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
+```
+
+They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
 
 ```c
 /* Data structure passed through the queue */

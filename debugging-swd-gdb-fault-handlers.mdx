@@ -220,7 +220,9 @@ When the Cortex-M3 encounters an error it cannot handle (invalid memory access, 
 
   In GDB: print/x stack_frame[6]
   gives the PC of the faulting instruction.
-``` The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
+```
+
+The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
 
 ### HardFault Handler
 
@@ -329,7 +331,9 @@ ITM (Instrumentation Trace Macrocell) is a hardware debug feature that sends dat
                         | OpenOCD     |
                         | /tmp/itm.fifo
                         +-------------+
-``` Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
+```
+
+Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
 
 ### ITM Printf
 
