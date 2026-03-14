@@ -12,6 +12,8 @@ sidebar:
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Contributors Welcome](https://img.shields.io/badge/contributors-welcome-orange)
 
+**Read this course at:** [https://siliconwit.com/education/embedded-programming-stm32/](https://siliconwit.com/education/embedded-programming-stm32/)
+
 A course on STM32 ARM Cortex-M development covering HAL and register-level programming. Topics include clock configuration, DMA, communication peripherals, FreeRTOS integration, and production firmware practices.
 
 ## Lessons
