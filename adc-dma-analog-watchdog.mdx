@@ -64,6 +64,26 @@ A monitoring system that continuously reads voltage from a potentiometer (ADC ch
 <InArticleAd />
 
 
+The ADC scan mode converts multiple channels in sequence, and DMA transfers each result to memory automatically. The CPU only needs to read the final values from the DMA buffer.
+
+```text
+  ADC continuous scan with DMA:
+
+  +------+   +------+   +------+
+  | CH0  |-->| CH16 |-->| CH17 |--+
+  | PA0  |   | Temp |   | Vref |  |
+  +------+   +------+   +------+  |
+     ^                             |
+     |          scan repeats       |
+     +-----------------------------+
+
+  DMA1 Channel 1 transfers:
+  ADC1->DR --> adc_values[0]  (CH0)
+  ADC1->DR --> adc_values[1]  (CH16)
+  ADC1->DR --> adc_values[2]  (CH17)
+  (circular: restarts automatically)
+```
+
 The STM32F103 has two ADC peripherals (ADC1 and ADC2), each with 12-bit resolution and up to 1 MHz sampling rate. ADC1 has a dedicated DMA channel (DMA1 Channel 1), making it the preferred choice for continuous background conversions. The ADC can convert a sequence of up to 16 channels in a single scan, and in continuous mode it repeats the sequence automatically.
 
 ### ADC Clock Requirements
@@ -179,7 +199,30 @@ void DMA1_Channel1_IRQHandler(void) {
 <InArticleAd />
 
 
-The analog watchdog is a hardware feature that compares every ADC conversion result against programmable high and low thresholds. When a conversion falls outside the allowed range, it sets a flag and optionally triggers an interrupt. This happens in hardware at ADC speed, so your firmware is notified within one conversion cycle (about 20 us at 12 MHz). Compare this to polling the ADC value in software, which depends on your loop speed and could miss brief spikes entirely.
+The analog watchdog is a hardware feature that compares every ADC conversion result against programmable high and low thresholds.
+
+```text
+  Analog watchdog operation:
+
+  ADC value
+  4095 |
+       |
+  HTR -+- - - - - - - - - - - - -  HIGH
+  3000 |                    *
+       |              *   *   *
+       |         *  *       *   ALERT!
+       |    *  *              *
+       |  *                     *
+       |*
+  LTR -+- - - - - - - - - - - - -  LOW
+   100 |
+     0 +---+---+---+---+---+----> time
+           |           |
+        normal      threshold
+        range       exceeded:
+                    AWD interrupt
+                    fires instantly
+``` When a conversion falls outside the allowed range, it sets a flag and optionally triggers an interrupt. This happens in hardware at ADC speed, so your firmware is notified within one conversion cycle (about 20 us at 12 MHz). Compare this to polling the ADC value in software, which depends on your loop speed and could miss brief spikes entirely.
 
 ### Watchdog Configuration
 
@@ -246,7 +289,29 @@ uint16_t adc_get_averaged(uint8_t channel) {
 <InArticleAd />
 
 
-The INA219 is a high-side current and power monitor with an I2C interface. It measures the voltage drop across a shunt resistor to calculate current, and it also measures the bus voltage. Most INA219 breakout boards include a 0.1 ohm shunt resistor, giving a maximum measurement range of about 3.2A. The INA219 has a built-in 12-bit ADC, so it returns calibrated current and power values directly over I2C.
+The INA219 is a high-side current and power monitor with an I2C interface. It measures the tiny voltage drop across a shunt resistor to determine current flow.
+
+```text
+  INA219 high-side current measurement:
+
+  V_supply ---+---[R_shunt 0.1R]---+--- Load
+              |                     |
+              |  INA219             |
+              |  +----------+      |
+              +->| V_IN+    |      |
+              |  |          |      |
+              +->| V_IN-    |<-----+
+                 |          |
+                 | V_BUS ---+-----> to load
+                 |          |
+       I2C <---->| SDA      |
+       I2C <---->| SCL      |
+                 +----------+
+
+  Current = V_shunt / R_shunt
+  INA219 does this calculation
+  internally and returns mA over I2C.
+``` It measures the voltage drop across a shunt resistor to calculate current, and it also measures the bus voltage. Most INA219 breakout boards include a 0.1 ohm shunt resistor, giving a maximum measurement range of about 3.2A. The INA219 has a built-in 12-bit ADC, so it returns calibrated current and power values directly over I2C.
 
 ### INA219 Driver
 

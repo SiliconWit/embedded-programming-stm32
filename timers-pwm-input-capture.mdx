@@ -92,7 +92,28 @@ Center-aligned: 0 -> 1 -> ... -> ARR -> ARR-1 -> ... -> 0 -> 1 -> ...
 <InArticleAd />
 
 
-A standard hobby servo expects a PWM signal with a 20 ms period (50 Hz). The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
+A standard hobby servo expects a PWM signal with a 20 ms period (50 Hz). The pulse width within that period determines the shaft angle.
+
+```text
+  Servo PWM signal:
+
+  |<----------- 20 ms (50 Hz) ---------->|
+
+  0 deg:     ___                           ___
+            |   |                         |   |
+  __________| 0.5ms |_____________________| 0.5ms
+            |<->|
+
+  90 deg:    ______                        ___
+            |      |                      |
+  __________| 1.5ms  |___________________| 1.5
+            |<---->|
+
+  180 deg:   _________                     ___
+            |         |                   |
+  __________| 2.5ms     |________________| 2.5
+            |<------->|
+``` The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
 
 ### PWM Configuration
 
@@ -159,7 +180,30 @@ The STM32 timers support several output compare modes beyond basic PWM:
 <InArticleAd />
 
 
-In Lesson 2 we read the encoder in software by polling GPIO pins. The STM32 timers offer a much better approach: encoder mode. In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
+In Lesson 2 we read the encoder in software by polling GPIO pins. The STM32 timers offer a much better approach: encoder mode. The timer hardware counts directly from the quadrature signals without CPU intervention.
+
+```text
+  Hardware encoder mode (TIM3):
+
+  PA6 (TIM3_CH1) ----> TI1 input
+  PA7 (TIM3_CH2) ----> TI2 input
+
+  +--------+     +---------------+
+  |Encoder |     |     TIM3      |
+  | CLK ---+---->| TI1  Encoder  |
+  | DT  ---+---->| TI2  logic    |
+  +--------+     |       |       |
+                 |   +---+---+   |
+                 |   | CNT   |   |
+                 |   | (auto |   |
+                 |   | inc/  |   |
+                 |   | dec)  |   |
+                 |   +-------+   |
+                 +---------------+
+
+  CPU reads TIM3->CNT for position.
+  Zero CPU overhead during counting.
+``` In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
 
 ### Encoder Mode Configuration
 
@@ -218,7 +262,23 @@ int16_t encoder_hw_read(void) {
 <InArticleAd />
 
 
-Input capture records the timer counter value at the moment an external signal edge occurs. This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
+Input capture records the timer counter value at the moment an external signal edge occurs. By comparing two successive captures, you get the signal period.
+
+```text
+  Input capture for period measurement:
+
+  Signal: _____       _________       ____
+               |     |         |     |
+               |_____|         |_____|
+                ^                ^
+           capture1          capture2
+           (CNT=1000)        (CNT=6000)
+
+  Period = capture2 - capture1
+         = 6000 - 1000 = 5000 ticks
+  At 1 MHz timer clock: 5000 us = 5 ms
+  Frequency = 1 / 0.005 = 200 Hz
+``` This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
 
 ### Measuring a Signal Period
 

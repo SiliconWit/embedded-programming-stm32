@@ -124,6 +124,27 @@ After enabling a peripheral clock, the STM32 needs a few cycles before the perip
 <InArticleAd />
 
 
+Each GPIO pin on the STM32F103 is configured by 4 bits in either CRL (pins 0-7) or CRH (pins 8-15). The two MODE bits set direction and speed, while the two CNF bits set the electrical behavior.
+
+```text
+  CRL register layout (pins 0-7):
+
+  Bit: 31..28  27..24  23..20  19..16
+       CNF7 MODE7  CNF6 MODE6  CNF5 MODE5  CNF4 MODE4
+
+  Bit: 15..12  11..8   7..4    3..0
+       CNF3 MODE3  CNF2 MODE2  CNF1 MODE1  CNF0 MODE0
+
+  Each pin = 4 bits:
+  +------+------+
+  | CNF  | MODE |  CNF: 2 bits (config)
+  | [1:0]| [1:0]|  MODE: 2 bits (direction/speed)
+  +------+------+
+
+  Example: PA9 as AF push-pull, 50 MHz
+  CRH bits [7:4] = 0xB = CNF=10, MODE=11
+```
+
 The STM32F103 GPIO system is configured through two 32-bit configuration registers per port: CRL (pins 0-7) and CRH (pins 8-15). Each pin gets 4 bits of configuration, split into 2-bit MODE and 2-bit CNF fields. This is different from newer STM32 families (F4, L4, etc.) that use separate MODER, OTYPER, OSPEEDR, and PUPDR registers. The F103 approach is more compact but less intuitive.
 
 ### The Four GPIO Modes
@@ -172,7 +193,31 @@ AFIO->MAPR |= AFIO_MAPR_USART1_REMAP;
 <InArticleAd />
 
 
-The KY-040 rotary encoder outputs two quadrature signals (CLK and DT) that are 90 degrees out of phase. When you rotate clockwise, CLK leads DT. When you rotate counterclockwise, DT leads CLK. By reading both signals on each CLK edge, you can determine both the direction and the number of steps. The push button (SW) is a simple active-low signal.
+The KY-040 rotary encoder outputs two quadrature signals (CLK and DT) that are 90 degrees out of phase.
+
+```text
+  Quadrature encoder signals:
+
+  Clockwise rotation:
+  CLK: __    ____    ____    __
+        |__|    |__|    |__|
+  DT:     ____    ____    ____
+       __|    |__|    |__|
+
+  CLK leads DT by 90 degrees.
+
+  Counter-clockwise rotation:
+  CLK:    ____    ____    ____
+       __|    |__|    |__|
+  DT:  __    ____    ____    __
+        |__|    |__|    |__|
+
+  DT leads CLK by 90 degrees.
+
+  Read DT on CLK falling edge:
+    DT=1 --> clockwise
+    DT=0 --> counter-clockwise
+``` When you rotate clockwise, CLK leads DT. When you rotate counterclockwise, DT leads CLK. By reading both signals on each CLK edge, you can determine both the direction and the number of steps. The push button (SW) is a simple active-low signal.
 
 ### Wiring
 
@@ -377,6 +422,24 @@ int main(void) {
 ```
 
 ### Testing
+
+The UART connection crosses TX to RX between the two devices.
+
+```text
+  UART serial connection:
+
+  Blue Pill              USB-Serial Adapter
+  +----------+           +----------+
+  |          |           |          |
+  | PA9  TX -+---------->| RX       |
+  | PA10 RX -+<----------| TX       |
+  | GND -----+---------->| GND      |
+  |          |           |          |
+  +----------+           +-----+----+
+                               |
+                            USB to PC
+                         (115200 baud)
+```
 
 Connect PA9 (TX) to a USB-to-serial adapter's RX pin (or use the ST-Link's virtual COM if supported). Open a serial terminal at 115200 baud. You should see the menu. Rotating the encoder scrolls through options, and pressing it prints the selected item.
 

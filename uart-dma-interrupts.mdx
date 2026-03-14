@@ -66,6 +66,23 @@ The Nested Vectored Interrupt Controller (NVIC) manages all interrupts on the Co
 
 ### Priority Grouping
 
+The NVIC processes interrupts based on their priority number. Lower numbers mean higher urgency. When a higher-priority interrupt fires during a lower-priority ISR, it preempts immediately.
+
+```text
+  NVIC interrupt nesting:
+
+  Priority 0 (highest)
+  Priority 1  |  +--[USART1 IDLE]--+
+  Priority 2  |  |  +--[DMA TX]--+ |
+  Priority 3  |  |  |            | |
+              |  |  |            | |
+  main()  ----+--+--+            +-+---
+              ^     ^            ^ ^
+           USART1  DMA_TX     DMA  USART1
+           fires   preempts   done returns
+                   USART1
+```
+
 The 4 priority bits can be split between preemption priority (which interrupts can preempt others) and sub-priority (tie-breaking when two interrupts fire simultaneously):
 
 | Group Setting | Preemption Bits | Sub-priority Bits | Preemption Levels |
@@ -100,7 +117,24 @@ void nvic_config(void) {
 <InArticleAd />
 
 
-DMA (Direct Memory Access) transfers data between peripherals and memory without CPU involvement. The CPU sets up the transfer (source address, destination address, byte count, direction) and the DMA controller handles the rest. On the STM32F103, DMA1 has 7 channels, each hardwired to specific peripheral requests. You cannot freely assign any peripheral to any channel.
+DMA (Direct Memory Access) transfers data between peripherals and memory without CPU involvement. The DMA controller reads from one address and writes to another, incrementing pointers and decrementing the count automatically.
+
+```text
+  DMA transfer: USART1 RX to memory
+
+  +----------+     +-----------+     +--------+
+  | USART1   |     |  DMA1     |     |  SRAM  |
+  | DR reg   |---->| Channel 5 |---->| rx_buf |
+  | (CPAR)   |     |           |     | (CMAR) |
+  +----------+     | CNDTR=256 |     +--------+
+                   | (count)   |
+  Peripheral       +-----------+     Memory
+  address fixed,                     address
+  no increment                       increments
+
+  In circular mode, CNDTR reloads
+  automatically and CMAR wraps to start.
+``` The CPU sets up the transfer (source address, destination address, byte count, direction) and the DMA controller handles the rest. On the STM32F103, DMA1 has 7 channels, each hardwired to specific peripheral requests. You cannot freely assign any peripheral to any channel.
 
 ### DMA1 Channel Assignments (Relevant Channels)
 
@@ -201,7 +235,27 @@ uint16_t uart_dma_read_line(char *dest, uint16_t max_len) {
 
 ### Idle Line Detection
 
-The UART idle line interrupt fires when the RX line has been idle for one frame duration after receiving data. This is the perfect trigger for "a complete message has arrived" because most serial terminals send commands as a burst of characters followed by silence. You do not need to poll or wait for a specific delimiter; the idle interrupt tells you when the sender has stopped transmitting.
+The UART idle line interrupt fires when the RX line has been idle for one frame duration after receiving data. This provides natural message boundary detection.
+
+```text
+  Idle line detection:
+
+  RX line:  ____  __ __ __ __ __  ____________
+                 |__|  |__|  |__|
+                 h  e  l  p  \n
+                 <-- data -->  <-- idle -->
+                                    ^
+                               IDLE interrupt
+                               fires here
+
+  DMA circular buffer state:
+  +---+---+---+---+---+---+---+---+
+  | h | e | l | p |\n |   |   |   |
+  +---+---+---+---+---+---+---+---+
+    ^                   ^
+    read_pos         write_pos
+                     (= 256 - CNDTR)
+``` This is the perfect trigger for "a complete message has arrived" because most serial terminals send commands as a burst of characters followed by silence. You do not need to poll or wait for a specific delimiter; the idle interrupt tells you when the sender has stopped transmitting.
 
 ```c
 volatile uint8_t rx_data_ready = 0;

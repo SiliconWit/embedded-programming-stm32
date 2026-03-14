@@ -63,6 +63,23 @@ A pre-written firmware project with five intentionally planted bugs that cause v
 
 OpenOCD acts as a bridge between GDB and the ST-Link hardware. It speaks USB to the ST-Link and GDB Remote Serial Protocol to GDB.
 
+```text
+  Debug toolchain:
+
+  +-------+  GDB RSP   +---------+  USB  +--------+
+  |  GDB  |<---------->| OpenOCD |<----->| ST-Link|
+  | (PC)  | port 3333  | (PC)    |       | V2     |
+  +-------+            +---------+       +---+----+
+                                             |
+                                          SWD (2 wires)
+                                             |
+                                         +---+------+
+                                         | STM32    |
+                                         | Cortex-M3|
+                                         | (target) |
+                                         +----------+
+```
+
 ```bash
 # Terminal 1: Start OpenOCD
 openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
@@ -176,7 +193,34 @@ print *((GPIO_TypeDef*)0x40010800)
 <InArticleAd />
 
 
-When the Cortex-M3 encounters an error it cannot handle (invalid memory access, undefined instruction, divide by zero with the trap enabled), it triggers a HardFault exception. The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
+When the Cortex-M3 encounters an error it cannot handle (invalid memory access, undefined instruction, divide by zero with the trap enabled), it triggers a HardFault exception. The CPU saves its state on the stack so a fault handler can inspect what went wrong.
+
+```text
+  HardFault stack frame (pushed by HW):
+
+  Higher address (older data)
+  +----------------+
+  | xPSR           |  SP + 28
+  +----------------+
+  | PC (return)    |  SP + 24  <-- faulting
+  +----------------+               instruction
+  | LR             |  SP + 20
+  +----------------+
+  | R12            |  SP + 16
+  +----------------+
+  | R3             |  SP + 12
+  +----------------+
+  | R2             |  SP + 8
+  +----------------+
+  | R1             |  SP + 4
+  +----------------+
+  | R0             |  SP + 0
+  +----------------+
+  Lower address (SP after fault)
+
+  In GDB: print/x stack_frame[6]
+  gives the PC of the faulting instruction.
+``` The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
 
 ### HardFault Handler
 
@@ -258,7 +302,34 @@ print/x *(uint32_t*)0xE000ED38    # BFAR
 <InArticleAd />
 
 
-ITM (Instrumentation Trace Macrocell) is a hardware debug feature that sends data from the MCU to the debugger through the SWO (Serial Wire Output) pin. Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
+ITM (Instrumentation Trace Macrocell) is a hardware debug feature that sends data from the MCU to the debugger through the SWO (Serial Wire Output) pin. It provides printf-style output without consuming a UART.
+
+```text
+  ITM trace output path:
+
+  Firmware            Cortex-M3 debug HW
+  +---------+        +------------------+
+  | ITM     |  write | ITM stimulus     |
+  | PORT[0] |------->| port 0           |
+  | .u8 = c |        +--------+---------+
+  +---------+                  |
+                               v
+                        +------+------+
+                        | TPIU        |
+                        | (Trace Port)|
+                        +------+------+
+                               |
+                            SWO pin (PB3)
+                               |
+                        +------+------+
+                        | ST-Link V2  |
+                        +------+------+
+                               |
+                        +------+------+
+                        | OpenOCD     |
+                        | /tmp/itm.fifo
+                        +-------------+
+``` Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
 
 ### ITM Printf
 

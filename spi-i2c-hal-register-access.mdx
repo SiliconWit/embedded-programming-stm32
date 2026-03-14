@@ -62,7 +62,27 @@ A real-time dashboard showing temperature, humidity, and pressure readings from 
 <InArticleAd />
 
 
-The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus (72 MHz max) and SPI2 on APB1 (36 MHz max). SPI1 can run at up to 18 MHz in master mode (72 MHz / 4), which is plenty fast for driving OLED displays. SPI is a synchronous, full-duplex protocol with four signals: SCK (clock), MOSI (master out, slave in), MISO (master in, slave out), and CS (chip select, active low).
+The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus (72 MHz max) and SPI2 on APB1 (36 MHz max).
+
+```text
+  SPI1 wiring to SSD1306 OLED:
+
+  Blue Pill              SSD1306 OLED
+  +----------+           +----------+
+  |          |           |          |
+  | PA5 SCK -+---------->| D0 CLK   |
+  | PA7 MOSI-+---------->| D1 MOSI  |
+  | PA4 CS  -+---------->| CS       |
+  | PA3 DC  -+---------->| DC       |
+  | PA2 RST -+---------->| RES      |
+  |          |           |          |
+  | 3.3V ----+---------->| VCC      |
+  | GND -----+---------->| GND      |
+  +----------+           +----------+
+
+  DC pin: LOW = command, HIGH = data
+  CS pin: LOW = selected (active)
+``` SPI1 can run at up to 18 MHz in master mode (72 MHz / 4), which is plenty fast for driving OLED displays. SPI is a synchronous, full-duplex protocol with four signals: SCK (clock), MOSI (master out, slave in), MISO (master in, slave out), and CS (chip select, active low).
 
 ### SPI Configuration Registers
 
@@ -236,6 +256,33 @@ void oled_string(uint8_t x, uint8_t y, const char *str);
 
 <InArticleAd />
 
+
+The I2C1 peripheral connects to the BME280 sensor. Both SDA and SCL are open-drain with external pull-ups provided by the BME280 breakout board.
+
+```text
+  I2C1 wiring to BME280:
+
+  Blue Pill              BME280
+  +----------+           +----------+
+  |          |     VCC   |          |
+  |          |      |    |          |
+  |          |    [4.7K] |          |
+  |          |      |    |          |
+  | PB6 SCL -+------+-->| SCL      |
+  |          |           |          |
+  |          |     VCC   |          |
+  |          |      |    |          |
+  |          |    [4.7K] |          |
+  |          |      |    |          |
+  | PB7 SDA -+------+-<>| SDA      |
+  |          |           |          |
+  | GND -----+--------->| GND SDO  |
+  | 3.3V ----+--------->| VCC CSB  |
+  +----------+           +----------+
+
+  SDO to GND: address = 0x76
+  SDO to VCC: address = 0x77
+```
 
 The STM32F103 I2C peripheral is notoriously tricky at the register level. It has known silicon errata (especially around the BUSY flag getting stuck) and requires careful sequencing of register reads and writes. This is one area where HAL genuinely saves debugging time. We will implement both approaches so you can see the complexity difference firsthand.
 
@@ -430,6 +477,27 @@ void bme280_read(int32_t *temp_c100, uint32_t *press_pa, uint32_t *hum_q10) {
 
 <InArticleAd />
 
+
+The project uses both SPI and I2C buses simultaneously, each talking to a different peripheral. The STM32 CPU orchestrates both without conflicts because they are independent hardware blocks.
+
+```text
+  Dual-bus architecture:
+
+            STM32F103
+  +---------------------------+
+  |                           |
+  |  SPI1 (18 MHz)            |
+  |    PA5 SCK  ----+         |
+  |    PA7 MOSI ----+--> SSD1306
+  |    PA4 CS   ----+    OLED
+  |    PA3 DC   ----+   (display)
+  |                           |
+  |  I2C1 (400 kHz)           |
+  |    PB6 SCL  ----+         |
+  |    PB7 SDA  ----+--> BME280
+  |                  |   (sensor)
+  +---------------------------+
+```
 
 After building both versions, here is what we measured on a real Blue Pill:
 

@@ -157,6 +157,28 @@ SRCS += $(FREERTOS_SRCS)
 
 ### Tasks
 
+The FreeRTOS scheduler switches between tasks based on priority. Each task has its own stack and runs independently. The SysTick interrupt drives the tick timer that triggers context switches.
+
+```text
+  FreeRTOS task scheduling (preemptive):
+
+  Priority 3  [Sensor ]       [Sensor ]
+  Priority 2         [Display]        [Display]
+  Priority 1                 [Logger  ]
+  Priority 0  [Idle]                     [Idle]
+              +----+--+------+-+------+--+-----> time
+              ^    ^  ^      ^ ^      ^
+              |    |  |      | |      |
+           Sensor Display Logger Sensor Display
+           wakes  gets   gets  wakes  gets
+           (500ms) data   CPU   again  data
+                  from
+                  queue
+
+  Higher priority always preempts lower.
+  Blocked tasks consume zero CPU time.
+```
+
 A FreeRTOS task is a C function that runs in its own context with its own stack. The scheduler switches between tasks based on priority: the highest-priority ready task always runs. When a task blocks (waiting on a queue, semaphore, or delay), the scheduler immediately switches to the next highest-priority ready task. Tasks never return; they contain an infinite loop and use `vTaskDelay()` or blocking API calls to yield CPU time.
 
 ```c
@@ -186,7 +208,30 @@ xTaskCreate(sensor_task,       /* Function */
 
 ### Queues
 
-Queues are the primary way to pass data between tasks. They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
+Queues are the primary way to pass data between tasks. Data flows from producers to consumers through a thread-safe FIFO.
+
+```text
+  Queue-based data flow:
+
+  +--------+   xQueueSend   +---------+
+  | Sensor |===============>| Queue   |
+  | Task   |  sensor_data_t | (4 slots|
+  | (P3)   |                | x 12B)  |
+  +--------+                +----+----+
+                                 |
+                    xQueueReceive|
+                         +-------+------+
+                         |              |
+                    +----+---+    +-----+---+
+                    | Display|    | Logger  |
+                    | Task   |    | Task    |
+                    | (P2)   |    | (P1)    |
+                    +--------+    +---------+
+
+  Sensor sends every 500 ms.
+  Display and Logger consume data.
+  Queue blocks consumers when empty.
+``` They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
 
 ```c
 /* Data structure passed through the queue */
@@ -416,6 +461,27 @@ int main(void) {
 
 <InArticleAd />
 
+
+The following diagram shows how priority inversion happens and how mutex priority inheritance solves it.
+
+```text
+  Without priority inheritance:
+
+  P3 Sensor:  [run]....blocked on mutex....
+  P2 Display:      [runs, preempts Logger]
+  P1 Logger:   [holds mutex]..preempted....
+              Sensor starved!
+
+  With mutex priority inheritance:
+
+  P3 Sensor:  [run]..blocked..        [run]
+  P2 Display:                 ..wait..
+  P1->P3 Log: [holds mutex, boosted!] [P1]
+              ^                       ^
+          Logger inherits P3     mutex released,
+          to finish quickly      Logger returns
+                                 to priority 1
+```
 
 Priority inversion occurs when a high-priority task is blocked waiting for a resource held by a low-priority task, while a medium-priority task runs instead. The classic example: the sensor task (priority 3) tries to take the I2C mutex, but the logger task (priority 1) currently holds it. If the display task (priority 2) becomes ready, it preempts the logger, further delaying the mutex release and starving the sensor task.
 

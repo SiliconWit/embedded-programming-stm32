@@ -64,6 +64,28 @@ A self-contained data logger powered by a CR2032 coin cell (3V, ~220 mAh). The S
 <InArticleAd />
 
 
+The data logger's operating cycle consists of brief active periods separated by long Stop mode sleep intervals. This duty-cycling strategy is what makes months of battery life possible.
+
+```text
+  Data logger duty cycle:
+
+  Current
+  15 mA |  *         *         *
+        |  *         *         *
+        |  * active  * active  * active
+        |  * ~50ms   * ~50ms   * ~50ms
+  1.4uA +--+----+----+----+----+----+-->
+           |    |    |    |    |    |
+           sleep    sleep    sleep
+           60s      60s      60s
+
+  Average current:
+  (15mA x 0.05s + 1.4uA x 59.95s) / 60s
+  = ~13.9 uA
+
+  CR2032 (220 mAh) / 13.9 uA = ~1.8 years
+```
+
 The STM32F103 offers three low-power modes with different tradeoffs between power consumption and wakeup time. Choosing the right mode depends on how often you need to wake up and how fast the MCU must respond after waking. For a data logger that wakes every 60 seconds, Stop mode provides the best balance: very low current consumption with all SRAM and register contents preserved.
 
 ### Mode Comparison
@@ -103,6 +125,36 @@ Even with real-world inefficiencies (voltage regulator quiescent current, flash 
 
 <InArticleAd />
 
+
+The RTC runs from the 32.768 kHz LSE crystal even during Stop mode. The RTC alarm wakes the CPU by triggering EXTI line 17, which is one of the few interrupt sources active in Stop mode.
+
+```text
+  RTC wakeup in Stop mode:
+
+  LSE 32.768 kHz
+       |
+  +----+----+
+  | Prescaler|  /32768 = 1 Hz
+  +----+----+
+       |
+  +----+----+
+  | RTC CNT  |  increments every second
+  +----+----+
+       |     compare
+  +----+----+
+  | RTC ALR  |  alarm value
+  +----+----+
+       |  match?
+       v
+  +----+----+
+  | EXTI 17  |  wakes CPU from Stop mode
+  +----+----+
+       |
+  +----+----+
+  | CPU      |  resumes after __WFI()
+  | wakes up |  (clock reverts to HSI)
+  +----------+
+```
 
 The RTC on the STM32F103 is a simple 32-bit counter clocked by the LSE oscillator (32.768 kHz). It has a prescaler that divides 32768 Hz down to 1 Hz, incrementing the counter every second. The RTC alarm register triggers an interrupt when the counter matches the alarm value. During Stop mode, the RTC continues running on LSE power, which draws only a few hundred nanoamps.
 
@@ -231,6 +283,28 @@ When the STM32 exits Stop mode, the system clock reverts to the 8 MHz HSI oscill
 
 <InArticleAd />
 
+
+The W25Q flash stores log entries sequentially. When a sector boundary is reached, the firmware erases the next 4 KB sector before writing. The write pointer wraps around to the beginning when the end of flash is reached.
+
+```text
+  W25Q flash log layout (4 MB):
+
+  +--------+--------+--------+-- --+--------+
+  |Sector 0|Sector 1|Sector 2| ... |Sect.1023
+  | 4 KB   | 4 KB   | 4 KB   |     | 4 KB   |
+  +--------+--------+--------+-- --+--------+
+  |entry 0 |entry341|        |     |        |
+  |entry 1 |entry342|        |     |        |
+  |  ...   |  ...   |  <-- write pointer    |
+  |entry340|        |                       |
+  +--------+--------+-----------------------+
+  0x000000  0x001000  0x002000       0x3FFFFF
+
+  Each entry: 12 bytes
+  Entries per sector: 4096/12 = 341
+  Total capacity: ~349,000 entries
+  At 1/min: ~242 days of data
+```
 
 The W25Q32 is a 32 Mbit (4 MB) SPI NOR flash memory. It supports standard SPI at up to 104 MHz clock speed. Flash memory has a write constraint: you can only change bits from 1 to 0 by writing. To change bits from 0 to 1, you must erase an entire sector (4 KB). For data logging, you write sequentially through the flash, erasing sectors ahead of the write pointer when needed. The W25Q also has a power-down mode that reduces standby current from ~1 uA to ~0.1 uA.
 

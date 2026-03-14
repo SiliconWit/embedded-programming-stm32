@@ -117,7 +117,25 @@ openocd --version
 
 ### Connecting the ST-Link to the Blue Pill
 
-The ST-Link V2 connects to the Blue Pill through the SWD (Serial Wire Debug) interface. Four wires are all you need: SWDIO, SWCLK, GND, and 3.3V. The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
+The ST-Link V2 connects to the Blue Pill through the SWD (Serial Wire Debug) interface. Four wires are all you need: SWDIO, SWCLK, GND, and 3.3V.
+
+```text
+  SWD Connection:
+
+  ST-Link V2            Blue Pill
+  +----------+          +----------+
+  |          |          |          |
+  | SWDIO ---+--------->| SWDIO    |
+  | SWCLK ---+--------->| SWCLK    |
+  | GND -----+--------->| GND      |
+  | 3.3V ----+--------->| 3.3V     |
+  |          |          |          |
+  +----------+          +----------+
+    (USB to PC)       (STM32F103C8T6)
+
+  SWDIO: bidirectional data
+  SWCLK: clock from ST-Link
+``` The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
 
 | ST-Link Pin | Blue Pill Pin |
 |-------------|---------------|
@@ -153,6 +171,26 @@ The Cortex-M3 uses a fixed 4 GB address space divided into well-defined regions:
 | 0xE000_0000 - 0xE00F_FFFF | System | NVIC, SysTick, debug registers |
 
 ### Vector Table
+
+The Cortex-M3 boot sequence reads the vector table, loads the initial stack pointer, and jumps to the reset handler. This all happens in hardware before any of your code runs.
+
+```text
+  Cortex-M3 boot sequence:
+
+  1. Read word at 0x0000_0000 --> MSP
+     (set stack pointer)
+
+  2. Read word at 0x0000_0004 --> PC
+     (jump to Reset_Handler)
+
+  3. Reset_Handler executes:
+     +---------------------------+
+     | Copy .data flash -> SRAM  |
+     | Zero .bss section         |
+     | Call SystemInit()         |
+     | Call main()               |
+     +---------------------------+
+```
 
 The very first thing the Cortex-M3 reads after reset is the vector table, stored at address 0x0000_0000 (which maps to the start of flash at 0x0800_0000). The first entry is the initial stack pointer value. The second entry is the reset handler address. The remaining entries are exception and interrupt handler addresses.
 
@@ -235,7 +273,31 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);
 
 ### Clock Configuration (HSE + PLL = 72 MHz)
 
-The Blue Pill has an 8 MHz crystal connected to the HSE pins. We configure the PLL to multiply this by 9, giving us a 72 MHz system clock. The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
+The Blue Pill has an 8 MHz crystal connected to the HSE pins. We configure the PLL to multiply this by 9, giving us a 72 MHz system clock.
+
+```text
+  Clock configuration:
+
+  HSE crystal    PLL          SYSCLK
+  +-------+   +------+     +--------+
+  | 8 MHz |-->| x9   |---->| 72 MHz |
+  +-------+   +------+     +---+----+
+                                |
+                 +--------------+
+                 |         AHB prescaler /1
+                 v              |
+           +----------+    +---+----+
+           | SYSCLK   |   | 72 MHz |
+           | 72 MHz   |   +---+----+
+           +----------+       |
+                         +----+----+
+                         |         |
+                    APB2 /1   APB1 /2
+                    72 MHz    36 MHz
+                    (GPIO,    (TIM2-4,
+                     SPI1,     I2C,
+                     USART1)   USART2)
+``` The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
 
 ```c
 void clock_init(void) {
