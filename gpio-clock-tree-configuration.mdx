@@ -25,7 +25,7 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-A rotary encoder gives you infinite rotation with detented clicks, plus a push button, all from a single component. In this lesson you will wire a KY-040 encoder to the Blue Pill, read its quadrature signals through GPIO inputs, and build a scrollable menu that prints to a serial terminal. Along the way you will map out the full RCC clock tree and learn every GPIO configuration mode the STM32F103 offers. #STM32 #GPIO #ClockTree
+On simpler chips like the ATmega328P, you toggle a pin and it just works. The STM32 will not even let you read a GPIO until you enable its bus clock, and misconfiguring the clock tree means your UART baud rate is wrong, your timers run at unexpected frequencies, and your SPI link drops bytes. Getting the clocks right first saves hours of debugging later. In this lesson you will map out the full RCC clock tree, learn every GPIO configuration mode the STM32F103 offers, and wire a KY-040 rotary encoder to the Blue Pill to build a scrollable serial menu that exercises input pull-ups, alternate functions, and interrupt-capable pins. #STM32 #GPIO #ClockTree
 
 ## What We Are Building
 

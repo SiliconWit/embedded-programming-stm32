@@ -211,26 +211,31 @@ xTaskCreate(sensor_task,       /* Function */
 Queues are the primary way to pass data between tasks. Data flows from producers to consumers through a thread-safe FIFO.
 
 ```text
-  Queue-based data flow:
+  Queue-based data flow (two queues):
 
-  +--------+   xQueueSend   +---------+
-  | Sensor |===============>| Queue   |
-  | Task   |  sensor_data_t | (4 slots|
-  | (P3)   |                | x 12B)  |
-  +--------+                +----+----+
-                                 |
-                    xQueueReceive|
-                         +-------+------+
-                         |              |
-                    +----+---+    +-----+---+
-                    | Display|    | Logger  |
-                    | Task   |    | Task    |
-                    | (P2)   |    | (P1)    |
-                    +--------+    +---------+
+  +--------+   xQueueSend   +-------------+
+  | Sensor |===============>| xDisplayQueue|
+  | Task   |  sensor_data_t | (4 slots)   |
+  | (P3)   |                +------+------+
+  |        |                       |
+  |        |   xQueueSend   +------+------+
+  |        |===============>| xLogQueue   |
+  +--------+  sensor_data_t | (4 slots)   |
+                            +------+------+
+                                   |
+                    xQueueReceive  |
+                         +---------+
+                         |
+                    +----+---+    +----------+
+                    | Display|    | Logger   |
+                    | Task   |    | Task     |
+                    | (P2)   |    | (P1)     |
+                    +--------+    +----------+
+                    receives from  receives from
+                    xDisplayQueue  xLogQueue
 
-  Sensor sends every 500 ms.
-  Display and Logger consume data.
-  Queue blocks consumers when empty.
+  Sensor sends to both queues every 500 ms.
+  Each consumer has its own queue, so no data is lost.
 ```
 
 They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
@@ -290,16 +295,19 @@ if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 
 ```c
 /* Global handles */
-QueueHandle_t sensor_queue;
+QueueHandle_t xDisplayQueue;
+QueueHandle_t xLogQueue;
 SemaphoreHandle_t i2c_mutex;
 SemaphoreHandle_t spi_mutex;
 
 void rtos_init(void) {
-    sensor_queue = xQueueCreate(4, sizeof(sensor_data_t));
+    xDisplayQueue = xQueueCreate(4, sizeof(sensor_data_t));
+    xLogQueue = xQueueCreate(4, sizeof(sensor_data_t));
     i2c_mutex = xSemaphoreCreateMutex();
     spi_mutex = xSemaphoreCreateMutex();
 
-    configASSERT(sensor_queue != NULL);
+    configASSERT(xDisplayQueue != NULL);
+    configASSERT(xLogQueue != NULL);
     configASSERT(i2c_mutex != NULL);
     configASSERT(spi_mutex != NULL);
 }
@@ -322,8 +330,9 @@ void sensor_task(void *params) {
                         &data.humidity_q10);
             xSemaphoreGive(i2c_mutex);
 
-            /* Send to queue (overwrite oldest if full) */
-            xQueueSend(sensor_queue, &data, 0);
+            /* Send to both queues (overwrite oldest if full) */
+            xQueueSend(xDisplayQueue, &data, 0);
+            xQueueSend(xLogQueue, &data, 0);
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -334,6 +343,8 @@ void sensor_task(void *params) {
 ### Display Task (Priority 2)
 
 ```c
+#include <stdio.h>
+
 void display_task(void *params) {
     (void)params;
     oled_init();
@@ -343,7 +354,7 @@ void display_task(void *params) {
 
     for (;;) {
         /* Wait for data from sensor task */
-        if (xQueueReceive(sensor_queue, &data, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (xQueueReceive(xDisplayQueue, &data, pdMS_TO_TICKS(1000)) == pdTRUE) {
             /* Acquire SPI bus for OLED */
             if (xSemaphoreTake(spi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 oled_clear();
@@ -391,8 +402,8 @@ void logger_task(void *params) {
     uint32_t sample_count = 0;
 
     for (;;) {
-        /* Peek at queue (do not remove, display task also reads) */
-        if (xQueuePeek(sensor_queue, &data, pdMS_TO_TICKS(2000)) == pdTRUE) {
+        /* Receive from dedicated log queue */
+        if (xQueueReceive(xLogQueue, &data, pdMS_TO_TICKS(2000)) == pdTRUE) {
             sample_count++;
             int len = snprintf(buf, sizeof(buf),
                 "[%06lu] T=%ld.%02ldC P=%luPa H=%lu.%lu%%\r\n",

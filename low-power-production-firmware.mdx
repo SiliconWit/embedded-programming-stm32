@@ -510,6 +510,8 @@ int main(void) {
 
 
 ```c
+#include <stdio.h>
+
 void cmd_dump_log(void) {
     uint32_t addr = FLASH_LOG_START;
     uint32_t write_ptr = get_write_pointer();
@@ -519,12 +521,26 @@ void cmd_dump_log(void) {
 
     uart_send_string("timestamp,temp_c,pressure_hpa,humidity_pct,battery_mv\r\n");
 
-    while (addr < write_ptr) {
+    /* Determine how many bytes to read, handling wrap-around.
+     * If write_ptr >= FLASH_LOG_START and the log has not wrapped,
+     * we read from start to write_ptr. If write_ptr has wrapped
+     * (written past the end and back to the beginning), we read
+     * from write_ptr to the end, then from the start to write_ptr. */
+    uint32_t total_bytes;
+    if (write_ptr >= FLASH_LOG_START) {
+        total_bytes = write_ptr - FLASH_LOG_START;
+    } else {
+        total_bytes = (FLASH_LOG_END + 1 - FLASH_LOG_START);
+    }
+    uint32_t entries_to_read = total_bytes / ENTRY_SIZE;
+
+    for (uint32_t i = 0; i < entries_to_read; i++) {
         w25q_read(addr, (uint8_t *)&entry, ENTRY_SIZE);
 
         /* Skip erased entries (all 0xFF) */
         if (entry.timestamp == 0xFFFFFFFF) {
             addr += ENTRY_SIZE;
+            if (addr >= FLASH_LOG_END) addr = FLASH_LOG_START;
             continue;
         }
 
@@ -541,6 +557,7 @@ void cmd_dump_log(void) {
         uart_send_string(buf);
 
         addr += ENTRY_SIZE;
+        if (addr >= FLASH_LOG_END) addr = FLASH_LOG_START;
         count++;
     }
 
@@ -634,18 +651,20 @@ void jump_to_bootloader(void) {
 
 ```c
 void peripherals_off(void) {
-    /* Disable all peripheral clocks except RTC and backup domain */
-    RCC->APB1ENR = RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
-    RCC->APB2ENR = 0;
-    RCC->AHBENR = 0;
-
-    /* Set all unused GPIO pins to analog mode (lowest leakage) */
+    /* Set all unused GPIO pins to analog mode FIRST (lowest leakage).
+     * This must happen while GPIO clocks are still enabled,
+     * otherwise the register writes have no effect. */
     GPIOA->CRL = 0x00000000;
     GPIOA->CRH = 0x00000000;
     GPIOB->CRL = 0x00000000;
     GPIOB->CRH = 0x00000000;
     GPIOC->CRL = 0x00000000;
     GPIOC->CRH = 0x00000000;
+
+    /* Now disable all peripheral clocks except RTC and backup domain */
+    RCC->APB1ENR = RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    RCC->APB2ENR = 0;
+    RCC->AHBENR = 0;
 }
 
 void peripherals_on(void) {
