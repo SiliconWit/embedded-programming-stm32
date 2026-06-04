@@ -468,6 +468,10 @@ int main(void) {
 }
 ```
 
+:::tip[Instrument it]
+The analog watchdog you set up here is a hardware condition-monitor: it watches an ADC channel and fires an interrupt the moment a reading leaves a safe band, with zero CPU polling. Wire an accelerometer or the INA219's current output into it and you have a sensor that raises a flag the instant vibration or current crosses a limit, ideal for a motor or pump. The [STM32](/education/sensor-actuator-interfacing-stm32/) can act locally, cutting a relay, and [raise the alarm](https://siliconwit.io) so a human sees it too.
+:::
+
 ## What You Have Learned
 
 <InArticleAd />

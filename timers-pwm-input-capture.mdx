@@ -439,6 +439,10 @@ int main(void) {
 The SG90 draws up to 500 mA under load. USB power from the Blue Pill may be insufficient, especially if the servo stalls. For reliable operation, power the servo from a separate 5V supply with its ground connected to the Blue Pill's ground.
 :::
 
+:::tip[Instrument it]
+Input capture and the encoder interface are not just motor-control plumbing, they are measurement. Input capture times the gap between pulses, so a Hall sensor or optical pickup turns into a tachometer reading true RPM; the encoder interface counts position and direction with no CPU load, so a servo can confirm it actually reached the angle it was told. An [STM32](/education/sensor-actuator-interfacing-stm32/) closes that loop, and can [stream](/education/iot-systems/) speed and position to a [dashboard](https://siliconwit.io) so drift, slip, or a stalled axis shows up immediately.
+:::
+
 ## What You Have Learned
 
 <InArticleAd />
