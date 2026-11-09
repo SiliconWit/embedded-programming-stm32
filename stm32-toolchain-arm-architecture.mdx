@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-Most STM32 tutorials jump straight into HAL-generated code, skipping everything that happens before `main()` runs. In this lesson, you will install the complete ARM toolchain from scratch, flash a breathing LED onto the Blue Pill board, and trace the entire boot sequence from the vector table through startup assembly to your C code. Understanding these foundations makes every future debugging session faster and every peripheral configuration clearer. #STM32 #ARM #Toolchain
+When an STM32 program does not start at all, the fault is often in code you did not write: the part that runs before `main()`. Most tutorials skip that part, so the first failure there can cost days. In this lesson you install the ARM toolchain, put a breathing LED program into the Blue Pill board, and follow the chip from its first read of memory after reset to your C code. #STM32 #ARM #Toolchain
 
 ## What We Are Building
 
 <Card title="Breathing LED with HSE Clock and Timer PWM" icon="star">
-A smooth breathing LED that ramps brightness up and down using hardware PWM driven by a general-purpose timer. The HSE crystal provides an accurate 72 MHz system clock through the PLL, and the timer generates a PWM signal that sweeps duty cycle from 0% to 100% and back. No blocking delays; the LED breathes entirely in hardware while the CPU is free.
+An LED whose brightness rises and falls smoothly. PWM (pulse width modulation) sets the brightness: the pin switches on and off 1,000 times a second, and the fraction of each cycle that it is on (the duty cycle) sets how bright the LED looks. A timer, a hardware counter inside the chip, makes this signal, so the CPU is free. The PLL, a circuit that multiplies a clock, multiplies the 8 MHz board crystal (HSE, the high speed external clock) by 9 to give 72 MHz.
 </Card>
 
 **Project specifications:**
@@ -50,17 +50,18 @@ A smooth breathing LED that ramps brightness up and down using hardware PWM driv
 
 | Component | Quantity | Notes |
 |-----------|----------|-------|
-| Blue Pill (STM32F103C8T6) | 1 | The classic $2 development board |
-| ST-Link V2 clone | 1 | SWD programmer/debugger |
+| Blue Pill (STM32F103C8T6) | 1 | The classic 2 USD development board |
+| ST-Link V2 clone | 1 | Writes your program into the chip |
 | Breadboard | 1 | Full-size or half-size |
 | LED (any color, 3mm or 5mm) | 1 | External LED on PA0 |
-| 330 ohm resistor | 1 | Current limiting for LED |
+| 330 ohm resistor | 1 | Limits the LED current to about 4 mA (a pin should give about 8 mA at most) |
 | Jumper wires | 4+ | For connections |
 
 ## Installing the ARM Toolchain
 
 <InArticleAd />
 
+The compiler `arm-none-eabi-gcc` runs on your PC but produces code for the ARM chip. OpenOCD writes that code into the chip. STM32CubeMX is ST's graphical tool for pins and clocks.
 
 <Tabs>
 <TabItem label="Linux (Ubuntu/Debian)">
@@ -117,34 +118,20 @@ openocd --version
 
 ### Connecting the ST-Link to the Blue Pill
 
-The ST-Link V2 connects to the Blue Pill through the SWD (Serial Wire Debug) interface. Four wires are all you need: SWDIO, SWCLK, GND, and 3.3V.
+The ST-Link V2 programs and debugs the chip through SWD (Serial Wire Debug), with four wires: data (SWDIO), clock (SWCLK), ground and 3.3V.
 
 ```text
-  SWD Connection:
-
   ST-Link V2            Blue Pill
   +----------+          +----------+
-  |          |          |          |
-  | SWDIO ---+--------->| SWDIO    |
+  | SWDIO ---+<-------->| SWDIO    |
   | SWCLK ---+--------->| SWCLK    |
-  | GND -----+--------->| GND      |
+  | GND -----+----------| GND      |
   | 3.3V ----+--------->| 3.3V     |
-  |          |          |          |
   +----------+          +----------+
     (USB to PC)       (STM32F103C8T6)
-
-  SWDIO: bidirectional data
-  SWCLK: clock from ST-Link
 ```
 
-The Blue Pill has a 4-pin SWD header at the end of the board, usually labeled with small text on the silkscreen.
-
-| ST-Link Pin | Blue Pill Pin |
-|-------------|---------------|
-| SWDIO | SWDIO (DIO) |
-| SWCLK | SWCLK (CLK) |
-| GND | GND |
-| 3.3V | 3.3V |
+The Blue Pill has a 4-pin SWD header at the end of the board. Its small printed labels often read DIO for SWDIO and CLK for SWCLK.
 
 Test the connection:
 
@@ -159,42 +146,38 @@ You should see output ending with something like `Info : stm32f1x.cpu: hardware 
 <InArticleAd />
 
 
-The STM32F103 is built around the ARM Cortex-M3 core. Unlike application processors (Cortex-A), the Cortex-M series is designed specifically for microcontrollers: deterministic interrupt latency, a built-in NVIC (Nested Vectored Interrupt Controller), Thumb-2 instruction set only, and hardware-assisted exception handling. Understanding a few key architectural concepts will help you write better firmware and debug problems more effectively.
+The STM32F103 is an ARM Cortex-M3 core, the processor, with memory and peripherals (timers, serial ports, pin drivers) that ST adds around it. Four ideas explain what happens before `main()`.
 
 ### Memory Map
 
-The Cortex-M3 uses a fixed 4 GB address space divided into well-defined regions:
+The core reaches the program, the variables and the hardware through addresses, like houses numbered along one street. A **register** is a memory location that belongs to a peripheral: writing a number to it changes what the hardware does. So `TIM2->CCR1 = 500` is an ordinary write to address 0x4000_0034, which belongs to timer 2. The fixed regions:
 
 | Address Range | Region | STM32F103 Usage |
 |---------------|--------|-----------------|
-| 0x0000_0000 - 0x1FFF_FFFF | Code | Flash (aliased from 0x0800_0000) |
-| 0x2000_0000 - 0x3FFF_FFFF | SRAM | 20 KB SRAM |
-| 0x4000_0000 - 0x5FFF_FFFF | Peripherals | GPIO, UART, SPI, timers, etc. |
-| 0xE000_0000 - 0xE00F_FFFF | System | NVIC, SysTick, debug registers |
+| 0x0000_0000 to 0x1FFF_FFFF | Code | Flash at 0x0800_0000: keeps the program with power off |
+| 0x2000_0000 to 0x3FFF_FFFF | SRAM | 20 KB for variables, lost with power off |
+| 0x4000_0000 to 0x5FFF_FFFF | Peripherals | Registers of pins (GPIO), UART, SPI, timers |
+| 0xE000_0000 to 0xE00F_FFFF | System | Registers of the core: interrupts, SysTick, debug |
 
 ### Vector Table
 
-The Cortex-M3 boot sequence reads the vector table, loads the initial stack pointer, and jumps to the reset handler. This all happens in hardware before any of your code runs.
+After reset the core does not know where your program is. It reads a list of addresses, the vector table, at 0x0000_0000, which shows the same memory as the start of flash (0x0800_0000).
+
+- Entry 1: the starting value of the stack pointer. The stack is the RAM that holds local variables and return addresses; no C function runs without it.
+- Entry 2: the address of the reset handler, the first code to run.
+- The rest: the addresses of the fault and interrupt handlers.
+
+The hardware loads the first two entries before any code runs:
 
 ```text
-  Cortex-M3 boot sequence:
-
   1. Read word at 0x0000_0000 --> MSP
-     (set stack pointer)
+     (main stack pointer: where the stack begins)
 
   2. Read word at 0x0000_0004 --> PC
-     (jump to Reset_Handler)
+     (program counter: jump to Reset_Handler)
 
-  3. Reset_Handler executes:
-     +---------------------------+
-     | Copy .data flash -> SRAM  |
-     | Zero .bss section         |
-     | Call SystemInit()         |
-     | Call main()               |
-     +---------------------------+
+  3. Reset_Handler runs (the startup code)
 ```
-
-The very first thing the Cortex-M3 reads after reset is the vector table, stored at address 0x0000_0000 (which maps to the start of flash at 0x0800_0000). The first entry is the initial stack pointer value. The second entry is the reset handler address. The remaining entries are exception and interrupt handler addresses.
 
 ```c
 /* Simplified vector table structure */
@@ -211,11 +194,16 @@ uint32_t vector_table[] = {
 
 ### Startup Code
 
-The startup code runs before main(). It copies initialized data from flash to SRAM (the .data section), zeros out uninitialized global variables (the .bss section), calls any C++ constructors (if applicable), sets up the FPU (on Cortex-M4F), and finally calls main(). On the STM32F103, CMSIS provides SystemInit() which configures the clock tree before main() begins.
+The reset handler is the startup code. C expects global variables to be ready when `main()` begins, but after power-on RAM holds nothing useful. So the startup code:
+
+1. Copies the starting values of initialized globals from flash, which keeps them without power, to RAM, where the program can change them (the `.data` section).
+2. Fills with zero the globals that have no starting value (the `.bss` section).
+3. Calls `SystemInit()`, supplied with the device files, which puts the clocks in a known state.
+4. Calls `main()`.
 
 ### Linker Script
 
-The linker script tells the toolchain where to place code and data in memory:
+The compiler does not know this chip's memory. The linker script gives the start and size of flash and RAM, and which part of the program goes where:
 
 ```ld
 /* Minimal STM32F103C8T6 linker script excerpt */
@@ -252,6 +240,8 @@ SECTIONS
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 ```
 
+The last line is the first entry of the vector table: the end of RAM, 0x2000_0000 + 20 KB = 0x2000_5000. The stack starts there and grows downward.
+
 ## Building the Breathing LED
 
 <InArticleAd />
@@ -275,33 +265,27 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);
 
 ### Clock Configuration (HSE + PLL = 72 MHz)
 
-The Blue Pill has an 8 MHz crystal connected to the HSE pins. We configure the PLL to multiply this by 9, giving us a 72 MHz system clock.
+Every digital circuit in the chip moves one step on each tick of a clock, a signal at a fixed frequency. After reset the chip runs from an internal 8 MHz oscillator that is not very accurate. We select the accurate 8 MHz crystal on the HSE pins and let the PLL multiply it by 9: a 72 MHz system clock (SYSCLK), the maximum for this chip.
 
 ```text
-  Clock configuration:
-
-  HSE crystal    PLL          SYSCLK
-  +-------+   +------+     +--------+
-  | 8 MHz |-->| x9   |---->| 72 MHz |
-  +-------+   +------+     +---+----+
-                                |
-                 +--------------+
-                 |         AHB prescaler /1
-                 v              |
-           +----------+    +---+----+
-           | SYSCLK   |   | 72 MHz |
-           | 72 MHz   |   +---+----+
-           +----------+       |
-                         +----+----+
-                         |         |
-                    APB2 /1   APB1 /2
-                    72 MHz    36 MHz
-                    (GPIO,    (TIM2-4,
-                     SPI1,     I2C,
-                     USART1)   USART2)
+  HSE crystal     PLL        SYSCLK
+  +-------+    +------+    +--------+
+  | 8 MHz |--->|  x9  |--->| 72 MHz |
+  +-------+    +------+    +---+----+
+                               |
+                      AHB bus, /1: 72 MHz
+                               |
+              +----------------+---------+
+              |                          |
+     APB2 bus, /1: 72 MHz     APB1 bus, /2: 36 MHz
+     GPIO, SPI1, USART1       TIM2-4, I2C, USART2
 ```
 
-The AHB bus runs at 72 MHz, APB2 at 72 MHz, and APB1 at 36 MHz (maximum for APB1). The USB peripheral needs 48 MHz, which comes from the 72 MHz PLL output divided by 1.5.
+A bus is a set of internal lines that carries a clock and data to a group of peripherals. The AHB bus serves the core and the memory. From it branch APB2 at 72 MHz and APB1, whose peripherals must not run above 36 MHz, so its clock is divided by 2. A divider is called a prescaler.
+
+One rule surprises most people: when the APB1 clock is divided, the chip doubles the clock it gives to the timers on that bus. So TIM2 counts from 72 MHz, and the timer code below depends on this.
+
+In the code, each `while` line waits for a ready bit.
 
 ```c
 void clock_init(void) {
@@ -309,8 +293,8 @@ void clock_init(void) {
     RCC->CR |= RCC_CR_HSEON;
     while (!(RCC->CR & RCC_CR_HSERDY));
 
-    /* Configure flash latency for 72 MHz (2 wait states) */
-    FLASH->ACR |= FLASH_ACR_LATENCY_2;
+    /* Configure flash latency for 72 MHz (2 wait states, LATENCY = 010) */
+    FLASH->ACR |= FLASH_ACR_LATENCY_1;  /* Bit 1 of the field = value 2 */
 
     /* Configure PLL: HSE as source, multiply by 9 = 72 MHz */
     RCC->CFGR |= RCC_CFGR_PLLSRC;       /* HSE as PLL source */
@@ -330,6 +314,14 @@ void clock_init(void) {
 ```
 
 ### Timer PWM Setup
+
+The first two lines switch on the clocks of port A and TIM2: a peripheral without a clock ignores every write. Three registers then set the signal:
+
+- `PSC` (prescaler) divides the 72 MHz timer clock by 72, so the counter advances once each microsecond.
+- `ARR` (auto-reload) is the value at which the counter returns to zero. Counting 0 to 999 takes 1,000 microseconds, so the signal repeats at 1 kHz.
+- `CCR1` (compare) sets the brightness. The pin is high while the counter is below `CCR1`, so `CCR1 = 250` keeps the LED on for 25% of each cycle.
+
+`PSC` and `ARR` are written as the wanted number minus 1, because the hardware counts from 0.
 
 ```c
 void pwm_init(void) {
@@ -355,6 +347,8 @@ void pwm_init(void) {
 
 ### Main Loop (Breathing Effect)
 
+The loop changes `CCR1` by one count on each pass, from 0 up to 999 and down again. The timer does the rest.
+
 ```c
 #include "stm32f103xb.h"
 
@@ -379,7 +373,7 @@ int main(void) {
             direction = 1;
         }
 
-        /* Simple delay (will replace with SysTick in later lessons) */
+        /* Simple delay (replaced by the SysTick timer when you build the menu) */
         for (volatile uint32_t i = 0; i < step_delay; i++);
     }
 }
@@ -432,25 +426,25 @@ make
 make flash
 ```
 
-The LED on PA0 should now smoothly ramp up and down in brightness. If you see it blinking instead of breathing, check that the PWM output pin (PA0) is correctly wired and that the timer configuration matches the code above.
+`make flash` writes the program at 0x0800_0000, the start of flash. The LED on PA0 should now rise and fall smoothly. If it blinks instead, check the PA0 wiring and the timer configuration.
 
 ## Exploring with STM32CubeMX
 
 <InArticleAd />
 
 
-STM32CubeMX is ST's graphical configuration tool. It generates initialization code for clocks, peripherals, and pin assignments. While we wrote bare-register code above, CubeMX is invaluable for quickly checking pin alternate functions, visualizing the clock tree, and generating a starting point for complex configurations.
+STM32CubeMX generates setup code for clocks, peripherals and pins with HAL (hardware abstraction layer), ST's library of ready functions. It also shows which pin can carry which signal.
 
 <Steps>
 1. Open STM32CubeMX and create a new project for STM32F103C8T6.
 
-2. Click the **Clock Configuration** tab. Set HSE to 8 MHz, enable PLL, set the multiplier to x9, and verify the system clock shows 72 MHz. Notice how APB1 is limited to 36 MHz.
+2. Click the **Clock Configuration** tab. Set HSE to 8 MHz, enable PLL, set the multiplier to x9, and check that the system clock shows 72 MHz and APB1 shows 36 MHz.
 
-3. Back in the **Pinout** tab, click PA0 and set it to TIM2_CH1. Notice the pin turns green, indicating a valid alternate function assignment.
+3. Back in the **Pinout** tab, click PA0 and set it to TIM2_CH1. The pin turns green when the assignment is valid.
 
-4. Under **Timers > TIM2**, set Channel 1 to "PWM Generation CH1". Set the prescaler and auto-reload values to match our 1 kHz PWM configuration.
+4. Under **Timers > TIM2**, set Channel 1 to "PWM Generation CH1". Set the prescaler and auto-reload to our values for 1 kHz.
 
-5. Click **Generate Code** to see the HAL-based equivalent. Compare the generated `MX_TIM2_Init()` function with our register-level code above. The registers being written are the same; HAL wraps them in structures and error checking.
+5. Click **Generate Code** and compare the generated `MX_TIM2_Init()` with our code. The same registers are written; HAL wraps them in structures and error checks.
 </Steps>
 
 ## CMSIS and Device Headers
@@ -458,39 +452,35 @@ STM32CubeMX is ST's graphical configuration tool. It generates initialization co
 <InArticleAd />
 
 
-CMSIS (Cortex Microcontroller Software Interface Standard) provides a standardized way to access Cortex-M core registers and peripherals. The device header file (stm32f103xb.h) defines register addresses, bit field masks, and peripheral structures so you can write `TIM2->CCR1` instead of `*(volatile uint32_t*)0x40000034`. Every STM32 project uses these headers, whether you write bare-register code or use HAL.
+CMSIS (Cortex Microcontroller Software Interface Standard) is a set of files that gives each of the hundreds of registers a name. With the device header (`stm32f103xb.h`) you write `TIM2->CCR1` instead of `*(volatile uint32_t*)0x40000034`. Two sources for the headers:
 
-You can get the CMSIS and device headers from two sources:
-
-- **STM32CubeF1 package:** Download from ST's website or clone `https://github.com/STMicroelectronics/STM32CubeF1`. The headers are in `Drivers/CMSIS/Device/ST/STM32F1xx/Include/`.
-- **Generated by CubeMX:** When you generate code, CubeMX copies the necessary headers into your project.
+- The STM32CubeF1 package: clone `https://github.com/STMicroelectronics/STM32CubeF1`. The headers are in `Drivers/CMSIS/Device/ST/STM32F1xx/Include/`.
+- CubeMX: when you generate code, it copies the headers into your project.
 
 ## What You Have Learned
 
 <InArticleAd />
 
 
-<Card title="Lesson 1 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
-**Toolchain skills:**
-- Installed arm-none-eabi-gcc, OpenOCD, and STM32CubeMX
-- Connected ST-Link V2 to the Blue Pill via SWD
+**Toolchain:**
+- Installed the compiler, OpenOCD and STM32CubeMX
 - Built and flashed firmware from the command line
 
-**Architecture knowledge:**
-- Cortex-M3 memory map and fixed address regions
-- Vector table structure (initial SP, reset handler, interrupt handlers)
-- Startup code responsibilities (copy .data, zero .bss, call main)
-- Linker script sections and memory placement
+**Architecture:**
+- The memory map: a register is an address
+- The vector table: stack pointer first, reset handler second
+- Startup code: copy .data, zero .bss, call main
+- The linker script places code and data
 
-**Peripheral skills:**
-- Configured HSE crystal and PLL for 72 MHz system clock
-- Set up TIM2 in PWM mode with prescaler and auto-reload
-- Generated a breathing LED effect using hardware PWM
+**Peripherals:**
+- HSE crystal and PLL for a 72 MHz system clock
+- TIM2 PWM from prescaler, auto-reload and compare
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 2: GPIO and Clock Tree Configuration](/education/embedded-programming-stm32/gpio-clock-tree-configuration), you will build a rotary encoder menu system. You will explore the full RCC clock tree, AHB/APB bus architecture, and all four GPIO modes with their alternate functions.
+In [GPIO and Clock Tree Configuration](/education/embedded-programming-stm32/gpio-clock-tree-configuration/), you will build a menu controlled by a rotary knob, and see the whole clock tree and every mode of a pin.
 :::
 
 <EmbeddedProgrammingStm32Comments />

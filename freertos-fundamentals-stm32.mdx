@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-Up to this point, every project has used a single main loop with interrupt handlers. That works fine for simple firmware, but as complexity grows, the main loop turns into a tangled mess of timing workarounds and state machines. FreeRTOS solves this by letting you split your firmware into independent tasks, each with its own stack and priority. In this lesson you will restructure the sensor dashboard from previous lessons into clean, separate tasks that communicate through queues and share resources safely with mutexes. #STM32 #FreeRTOS #RTOS
+One main loop reads a sensor, draws a display and sends a log. Then the display takes 30 ms to draw, and the sensor reading that was due in that time is late. Each new job makes the timing of all the others worse, and the loop fills with counters and flags to work around it. FreeRTOS is a small real-time operating system (RTOS) that removes the problem: you write each job as a separate task, and a scheduler decides which task runs at each moment. In this lesson you rebuild the sensor dashboard as three tasks that pass data through queues and share the buses safely. #STM32 #FreeRTOS #RTOS
 
 ## What We Are Building
 
 <Card title="Multitasking Sensor Dashboard" icon="star">
-Three independent tasks running on FreeRTOS: a sensor task that reads the BME280 every 500 ms and pushes data into a queue, a display task that pulls from the queue and updates the SSD1306 OLED, and a serial logging task that formats readings and sends them over UART with DMA. A mutex protects the I2C bus (shared between the BME280 and the INA219), and a binary semaphore synchronizes the display update with fresh data arrival.
+Three independent FreeRTOS tasks: a sensor task that reads the BME280 every 500 ms and pushes data into a queue, a display task that takes it from the queue and updates the SSD1306 OLED, and a logging task that sends readings over UART with DMA. A mutex, a lock only one task can hold at a time, protects the I2C bus shared by the BME280 and the INA219.
 </Card>
 
 **Project specifications:**
@@ -87,13 +87,17 @@ Three independent tasks running on FreeRTOS: a sensor task that reads the BME280
 
 ### FreeRTOSConfig.h
 
+This file sets the size of the system. Three settings matter most at the start: the tick rate, how often the scheduler looks at the tasks (1000 times a second here); the heap, the RAM from which FreeRTOS takes memory for every task and queue (10 KB of the chip's 20 KB); and stack sizes, counted in 4-byte words, not bytes.
+
 ```c
 #ifndef FREERTOS_CONFIG_H
 #define FREERTOS_CONFIG_H
 
 /* Cortex-M3 specific */
 #define configCPU_CLOCK_HZ              72000000
-#define configSYSTICK_CLOCK_HZ          72000000
+/* Do not define configSYSTICK_CLOCK_HZ: the port then clocks SysTick
+ * from the core clock. Defining it selects HCLK/8 and the tick runs
+ * 8 times too slow. */
 
 /* Scheduler */
 #define configUSE_PREEMPTION            1
@@ -101,10 +105,12 @@ Three independent tasks running on FreeRTOS: a sensor task that reads the BME280
 #define configMAX_PRIORITIES            5
 #define configMINIMAL_STACK_SIZE        128   /* Words (512 bytes) */
 #define configTICK_RATE_HZ              1000  /* 1 ms tick */
+#define configUSE_16_BIT_TICKS          0     /* 32-bit tick counter */
 
 /* Memory */
 #define configTOTAL_HEAP_SIZE           10240  /* 10 KB for FreeRTOS heap */
 #define configUSE_MALLOC_FAILED_HOOK    1
+#define configCHECK_FOR_STACK_OVERFLOW  2
 
 /* Features */
 #define configUSE_MUTEXES               1
@@ -117,9 +123,13 @@ Three independent tasks running on FreeRTOS: a sensor task that reads the BME280
 
 /* Cortex-M interrupt priorities */
 #define configKERNEL_INTERRUPT_PRIORITY         255
-#define configMAX_SYSCALL_INTERRUPT_PRIORITY    191
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY    80   /* 5 << 4 */
 #define configLIBRARY_KERNEL_INTERRUPT_PRIORITY 15
 #define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY 5
+
+/* API functions used in this lesson */
+#define INCLUDE_vTaskDelay                  1
+#define INCLUDE_uxTaskGetStackHighWaterMark 1
 
 /* Map FreeRTOS handlers to standard names */
 #define vPortSVCHandler    SVC_Handler
@@ -137,7 +147,7 @@ FreeRTOS takes over SysTick for its tick timer. Remove any custom SysTick_Handle
 
 ```makefile
 # Add FreeRTOS sources
-FREERTOS_DIR = freertos/FreeRTOS/Source
+FREERTOS_DIR = freertos
 FREERTOS_SRCS = $(FREERTOS_DIR)/tasks.c \
                 $(FREERTOS_DIR)/queue.c \
                 $(FREERTOS_DIR)/list.c \
@@ -157,29 +167,22 @@ SRCS += $(FREERTOS_SRCS)
 
 ### Tasks
 
-The FreeRTOS scheduler switches between tasks based on priority. Each task has its own stack and runs independently. The SysTick interrupt drives the tick timer that triggers context switches.
+A task is a C function with an endless loop, written as if it were the only program on the chip. The processor runs one task at a time, and the scheduler chooses by one rule: of the tasks ready to run, the one with the highest priority runs.
+
+A task that waits (for a delay, for queue data, for a lock) is blocked: not ready, using no processor time. When a higher-priority task becomes ready, the scheduler pauses the running task at once, wherever it is (preemption). The paused task continues later from the same point.
 
 ```text
-  FreeRTOS task scheduling (preemptive):
-
-  Priority 3  [Sensor ]       [Sensor ]
-  Priority 2         [Display]        [Display]
-  Priority 1                 [Logger  ]
-  Priority 0  [Idle]                     [Idle]
-              +----+--+------+-+------+--+-----> time
-              ^    ^  ^      ^ ^      ^
-              |    |  |      | |      |
-           Sensor Display Logger Sensor Display
-           wakes  gets   gets  wakes  gets
-           (500ms) data   CPU   again  data
-                  from
-                  queue
-
-  Higher priority always preempts lower.
-  Blocked tasks consume zero CPU time.
+  P3  [Sensor ]             [Sensor ]
+  P2           [Display]             [Display]
+  P1                    [Logger]
+  P0                            [Idle]
+      +--------+--------+-------+----+-------> time
+      ^        ^        ^            ^
+      Sensor   Display  Logger       500 ms later:
+      wakes    has data runs last    Sensor wakes again
 ```
 
-A FreeRTOS task is a C function that runs in its own context with its own stack. The scheduler switches between tasks based on priority: the highest-priority ready task always runs. When a task blocks (waiting on a queue, semaphore, or delay), the scheduler immediately switches to the next highest-priority ready task. Tasks never return; they contain an infinite loop and use `vTaskDelay()` or blocking API calls to yield CPU time.
+To continue from the same point, a task must find its local variables and return addresses as it left them, so each task has its own stack, private RAM taken from the heap when the task is created: 256 words is 1024 bytes.
 
 ```c
 /* Task function signature */
@@ -208,37 +211,22 @@ xTaskCreate(sensor_task,       /* Function */
 
 ### Queues
 
-Queues are the primary way to pass data between tasks. Data flows from producers to consumers through a thread-safe FIFO.
+If two tasks share a global variable, one can be paused half-way through writing it, and the other reads a value half old and half new. A queue avoids this: a line of fixed-size slots, like the queue at a counter. One task puts a copy of its data at the back with `xQueueSend()`; another takes the oldest copy from the front with `xQueueReceive()`.
 
 ```text
-  Queue-based data flow (two queues):
-
-  +--------+   xQueueSend   +-------------+
-  | Sensor |===============>| xDisplayQueue|
-  | Task   |  sensor_data_t | (4 slots)   |
-  | (P3)   |                +------+------+
-  |        |                       |
-  |        |   xQueueSend   +------+------+
-  |        |===============>| xLogQueue   |
-  +--------+  sensor_data_t | (4 slots)   |
-                            +------+------+
-                                   |
-                    xQueueReceive  |
-                         +---------+
-                         |
-                    +----+---+    +----------+
-                    | Display|    | Logger   |
-                    | Task   |    | Task     |
-                    | (P2)   |    | (P1)     |
-                    +--------+    +----------+
-                    receives from  receives from
-                    xDisplayQueue  xLogQueue
-
-  Sensor sends to both queues every 500 ms.
-  Each consumer has its own queue, so no data is lost.
+               xDisplayQueue (4 slots)
+  +--------+   +--+--+--+--+   +---------+
+  | Sensor |-->|  |  |  |  |-->| Display |
+  | task   |   +--+--+--+--+   +---------+
+  | (P3)   |
+  |        |   xLogQueue (4 slots)
+  |        |   +--+--+--+--+   +---------+
+  |        |-->|  |  |  |  |-->| Logger  |
+  +--------+   +--+--+--+--+   +---------+
+   xQueueSend                 xQueueReceive
 ```
 
-They are thread-safe FIFO buffers with a fixed number of fixed-size slots. A producing task sends data with `xQueueSend()`, and a consuming task receives with `xQueueReceive()`. If the queue is full, the sender can block until space becomes available. If the queue is empty, the receiver blocks until data arrives. This blocking behavior is what makes FreeRTOS efficient: blocked tasks consume zero CPU time.
+A task that receives from an empty queue is blocked, using no processor time, until data arrives. A task that sends to a full queue can wait for a free slot, or give up at once and lose the data. The last argument of each call is the longest time to wait.
 
 ```c
 /* Data structure passed through the queue */
@@ -255,6 +243,8 @@ sensor_queue = xQueueCreate(4, sizeof(sensor_data_t));
 
 ### Semaphores
 
+Sometimes a task needs to know only that something happened, with no data. A binary semaphore is a flag for this. One task waits for it ("takes" it) and is blocked. Another task or an interrupt sets it ("gives" it), and the waiting task runs.
+
 ```c
 /* Binary semaphore: signal that new data is available */
 SemaphoreHandle_t data_ready_sem;
@@ -269,7 +259,9 @@ xSemaphoreTake(data_ready_sem, portMAX_DELAY);
 
 ### Mutexes
 
-A mutex (mutual exclusion) protects a shared resource so only one task accesses it at a time. Unlike a binary semaphore, a mutex has priority inheritance: if a low-priority task holds the mutex and a high-priority task is waiting for it, the low-priority task temporarily inherits the high priority to prevent priority inversion. Always use mutexes (not binary semaphores) for resource protection.
+Two tasks use the I2C bus. If one is paused mid-message and the other starts its own, both messages are spoiled. A mutex (mutual exclusion) is the one key to a room: a task takes it before using the bus and gives it back after. A task that finds it taken is blocked until it is free.
+
+Use a mutex, not a binary semaphore, to protect a bus or a buffer. The reason is priority inheritance, explained under Priority Inversion below.
 
 ```c
 /* Mutex for I2C bus */
@@ -330,7 +322,7 @@ void sensor_task(void *params) {
                         &data.humidity_q10);
             xSemaphoreGive(i2c_mutex);
 
-            /* Send to both queues (overwrite oldest if full) */
+            /* Send to both queues (the new sample is dropped if a queue is full) */
             xQueueSend(xDisplayQueue, &data, 0);
             xQueueSend(xLogQueue, &data, 0);
         }
@@ -417,12 +409,16 @@ void logger_task(void *params) {
             uart_dma_send(buf, len);
         }
 
+        /* The sensor sends 2 samples a second and this task takes 1, so
+         * xLogQueue fills and every second sample is dropped by the sender. */
         vTaskDelay(pdMS_TO_TICKS(1000));  /* Log once per second */
     }
 }
 ```
 
 ### Idle Hook (Low Power)
+
+When every task is blocked, FreeRTOS runs its own idle task, which calls the first function below. The other two are called by FreeRTOS when the heap is used up or a task writes past the end of its stack.
 
 ```c
 void vApplicationIdleHook(void) {
@@ -451,6 +447,9 @@ int main(void) {
     clock_init();
     uart_init();
     uart_dma_tx_init();
+    /* TX-complete interrupt that clears tx_busy for uart_dma_send() */
+    NVIC_SetPriority(DMA1_Channel4_IRQn, 6);
+    NVIC_EnableIRQ(DMA1_Channel4_IRQn);
     i2c1_init();
     spi1_init();
 
@@ -475,32 +474,27 @@ int main(void) {
 <InArticleAd />
 
 
-The following diagram shows how priority inversion happens and how mutex priority inheritance solves it.
+A lock can make the most important task wait for the least important one. The logger (priority 1) holds the I2C lock when the sensor task (priority 3) wants it, so the sensor task is blocked, correctly. Then the display task (priority 2) becomes ready and preempts the logger, which cannot finish and give the lock back. The sensor task now waits as long as the display task runs: a priority 2 task delays a priority 3 task. This is priority inversion.
 
 ```text
-  Without priority inheritance:
+  Lock without priority inheritance:
 
-  P3 Sensor:  [run]....blocked on mutex....
-  P2 Display:      [runs, preempts Logger]
-  P1 Logger:   [holds mutex]..preempted....
-              Sensor starved!
-
-  With mutex priority inheritance:
-
-  P3 Sensor:  [run]..blocked..        [run]
-  P2 Display:                 ..wait..
-  P1->P3 Log: [holds mutex, boosted!] [P1]
-              ^                       ^
-          Logger inherits P3     mutex released,
-          to finish quickly      Logger returns
-                                 to priority 1
+  P3 Sensor:   [run]....blocked on the lock....
+  P2 Display:        [runs, preempts Logger ]
+  P1 Logger:  [holds lock]....paused..........
 ```
 
-Priority inversion occurs when a high-priority task is blocked waiting for a resource held by a low-priority task, while a medium-priority task runs instead. The classic example: the sensor task (priority 3) tries to take the I2C mutex, but the logger task (priority 1) currently holds it. If the display task (priority 2) becomes ready, it preempts the logger, further delaying the mutex release and starving the sensor task.
+A FreeRTOS mutex prevents this with priority inheritance: while the sensor task waits, the logger is raised to priority 3, so the display task cannot preempt it. It finishes, gives the mutex back and returns to priority 1.
 
-FreeRTOS mutexes solve this with priority inheritance: when the sensor task (priority 3) blocks on the mutex, the logger task (priority 1) temporarily inherits priority 3, preempting the display task (priority 2) and releasing the mutex quickly.
+```text
+  Mutex with priority inheritance:
 
-This is why you should always use `xSemaphoreCreateMutex()` instead of `xSemaphoreCreateBinary()` when protecting shared resources.
+  P3 Sensor:   [run]..blocked..       [run]
+  P2 Display:                               [run]
+  P1 Logger:  [holds mutex, runs at P3]
+```
+
+A binary semaphore has no priority inheritance. So create a lock with `xSemaphoreCreateMutex()`, never with `xSemaphoreCreateBinary()`.
 
 ## Debugging FreeRTOS
 
@@ -509,9 +503,12 @@ This is why you should always use `xSemaphoreCreateMutex()` instead of `xSemapho
 
 ### Task List in GDB
 
+The stack high water mark is the smallest amount of free stack a task has ever had, in words. If it is near zero, the stack is too small.
+
 ```gdb
-# FreeRTOS-aware GDB commands (via OpenOCD)
-monitor freertos task-list
+# FreeRTOS-aware thread list. Start OpenOCD with this extra option first:
+#   -c "stm32f1x.cpu configure -rtos FreeRTOS"
+info threads
 
 # Examine a specific task's stack
 print *((TCB_t *)sensor_handle)
@@ -562,7 +559,7 @@ print uxTaskGetStackHighWaterMark(sensor_handle)
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 9: Low-Power Modes and Production Firmware](/education/embedded-programming-stm32/low-power-production-firmware), you will build a battery-powered data logger using RTC wakeup, SPI flash storage, and STM32 Stop/Standby sleep modes. You will learn to design firmware for months of battery life on a CR2032 coin cell.
+In [Lesson 9: Low-Power Modes and Production Firmware](/education/embedded-programming-stm32/low-power-production-firmware), you build a data logger that sleeps between readings and runs for months on one coin cell.
 :::
 
 <EmbeddedProgrammingStm32Comments />

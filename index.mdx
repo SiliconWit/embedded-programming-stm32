@@ -58,47 +58,47 @@ Each lesson follows a consistent cycle:
 
 <CardGrid>
   <Card title="Lesson 1: STM32 Toolchain and ARM Architecture" icon="star">
-    [STM32 Toolchain and ARM Architecture](./stm32-toolchain-arm-architecture). Set up arm-gcc, OpenOCD, and STM32CubeMX. Understand Cortex-M3 architecture: vector table, startup code, linker scripts, CMSIS. Build a breathing LED that demonstrates precise clock configuration.
+    [STM32 Toolchain and ARM Architecture](/education/embedded-programming-stm32/stm32-toolchain-arm-architecture/). Set up arm-gcc, OpenOCD, and STM32CubeMX. Understand Cortex-M3 architecture: vector table, startup code, linker scripts, CMSIS. Build a breathing LED that demonstrates precise clock configuration.
     **Build:** Breathing LED with HSE clock. **Parts:** Blue Pill, ST-Link V2, breadboard, LED.
   </Card>
 
   <Card title="Lesson 2: GPIO and Clock Tree Configuration" icon="document">
-    [GPIO and Clock Tree Configuration](./gpio-clock-tree-configuration). Master the RCC clock tree, AHB/APB buses, GPIO modes, and alternate functions. Build a rotary encoder menu system controlled through a serial terminal.
+    [GPIO and Clock Tree Configuration](/education/embedded-programming-stm32/gpio-clock-tree-configuration/). Master the RCC clock tree, AHB/APB buses, GPIO modes, and alternate functions. Build a rotary encoder menu system controlled through a serial terminal.
     **Build:** Rotary encoder menu system. **Parts:** KY-040 rotary encoder.
   </Card>
 
   <Card title="Lesson 3: Timers, PWM, and Input Capture" icon="document">
-    [Timers, PWM, and Input Capture](./timers-pwm-input-capture). Explore general-purpose and advanced timers: PWM generation, output compare, input capture, encoder interface. Build a servo-driven pan mechanism controlled by the rotary encoder.
+    [Timers, PWM, and Input Capture](/education/embedded-programming-stm32/timers-pwm-input-capture/). Explore general-purpose and advanced timers: PWM generation, output compare, input capture, encoder interface. Build a servo-driven pan mechanism controlled by the rotary encoder.
     **Build:** Servo pan mechanism. **Parts:** SG90 micro servo.
   </Card>
 
   <Card title="Lesson 4: UART with DMA and Interrupts" icon="document">
-    [UART with DMA and Interrupts](./uart-dma-interrupts). Configure USART with NVIC interrupt priorities and DMA channels. Implement circular buffers, idle line detection, and a command parser. Build an interactive command shell.
+    [UART with DMA and Interrupts](/education/embedded-programming-stm32/uart-dma-interrupts/). Configure USART with NVIC interrupt priorities and DMA channels. Implement circular buffers, idle line detection, and a command parser. Build an interactive command shell.
     **Build:** Interactive serial command shell. **Parts:** Reuse existing.
   </Card>
 
   <Card title="Lesson 5: SPI and I2C: HAL vs Register Level" icon="document">
-    [SPI and I2C: HAL vs Register Access](./spi-i2c-hal-register-access). Implement both protocols using HAL, then rewrite the drivers at register level. Compare code size, speed, and clarity. Build a sensor dashboard on OLED.
+    [SPI and I2C: HAL vs Register Access](/education/embedded-programming-stm32/spi-i2c-hal-register-access/). Implement both protocols using HAL, then rewrite the drivers at register level. Compare code size, speed, and clarity. Build a sensor dashboard on OLED.
     **Build:** Sensor dashboard on OLED. **Parts:** SSD1306 OLED, BME280.
   </Card>
 
   <Card title="Lesson 6: ADC with DMA and Analog Watchdog" icon="document">
-    [ADC with DMA and Analog Watchdog](./adc-dma-analog-watchdog). Configure multi-channel ADC scanning with DMA transfers and analog watchdog thresholds. Build a voltage and current monitor with visual alerts.
+    [ADC with DMA and Analog Watchdog](/education/embedded-programming-stm32/adc-dma-analog-watchdog/). Configure multi-channel ADC scanning with DMA transfers and analog watchdog thresholds. Build a voltage and current monitor with visual alerts.
     **Build:** Voltage/current monitor. **Parts:** INA219 current sensor module, potentiometer.
   </Card>
 
   <Card title="Lesson 7: Debugging with SWD and Fault Handlers" icon="document">
-    [Debugging with SWD, GDB, and Fault Handlers](./debugging-swd-gdb-fault-handlers). Master SWD debugging: breakpoints, watchpoints, register inspection, HardFault decoding, and ITM trace output. Receive intentionally buggy firmware and diagnose every fault.
+    [Debugging with SWD, GDB, and Fault Handlers](/education/embedded-programming-stm32/debugging-swd-gdb-fault-handlers/). Master SWD debugging: breakpoints, watchpoints, register inspection, HardFault decoding, and ITM trace output. Receive intentionally buggy firmware and diagnose every fault.
     **Build:** Bug hunt challenge (5 bugs to find and fix). **Parts:** No new parts.
   </Card>
 
   <Card title="Lesson 8: FreeRTOS on STM32" icon="document">
-    [FreeRTOS Fundamentals on STM32](./freertos-fundamentals-stm32). Introduce real-time multitasking: tasks, queues, semaphores, mutexes, and priority management. Build a multitasking dashboard with sensor reading, display, and serial logging as separate tasks.
+    [FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32/). Introduce real-time multitasking: tasks, queues, semaphores, mutexes, and priority management. Build a multitasking dashboard with sensor reading, display, and serial logging as separate tasks.
     **Build:** Multitasking sensor dashboard. **Parts:** Reuse existing.
   </Card>
 
   <Card title="Lesson 9: Low-Power and Production Firmware" icon="document">
-    [Low-Power Modes and Production Firmware](./low-power-production-firmware). Explore Stop/Standby modes, RTC wakeup, flash and option bytes, and bootloader basics. Build a battery-powered data logger that wakes periodically, logs to SPI flash, and sleeps.
+    [Low-Power Modes and Production Firmware](/education/embedded-programming-stm32/low-power-production-firmware/). Explore Stop/Standby modes, RTC wakeup, flash and option bytes, and bootloader basics. Build a battery-powered data logger that wakes periodically, logs to SPI flash, and sleeps.
     **Build:** Battery-powered data logger. **Parts:** CR2032 holder, W25Q SPI flash module.
   </Card>
 </CardGrid>
@@ -107,20 +107,20 @@ Each lesson follows a consistent cycle:
 
 | Part | Quantity | First Used | Approximate Cost |
 |------|----------|------------|-----------------|
-| Blue Pill (STM32F103C8T6) | 1 | Lesson 1 | $2-4 |
-| ST-Link V2 clone | 1 | Lesson 1 | $2-4 |
-| Breadboard + jumper wires | 1 set | Lesson 1 | $3-5 |
-| LEDs + 220R resistors | 2 | Lesson 1 | $0.50 |
-| KY-040 rotary encoder | 1 | Lesson 2 | $1 |
-| SG90 micro servo | 1 | Lesson 3 | $2 |
-| SSD1306 OLED display | 1 | Lesson 5 | $3-4 |
-| BME280 sensor module | 1 | Lesson 5 | $2-3 |
-| INA219 current sensor module | 1 | Lesson 6 | $2 |
-| Potentiometer (10K) | 1 | Lesson 6 | $0.25 |
-| CR2032 battery holder | 1 | Lesson 9 | $0.50 |
-| W25Q SPI flash module | 1 | Lesson 9 | $1-2 |
+| Blue Pill (STM32F103C8T6) | 1 | Lesson 1 | 2 to 4 USD |
+| ST-Link V2 clone | 1 | Lesson 1 | 2 to 4 USD |
+| Breadboard + jumper wires | 1 set | Lesson 1 | 3 to 5 USD |
+| LEDs + 220R resistors | 2 | Lesson 1 | 0.50 USD |
+| KY-040 rotary encoder | 1 | Lesson 2 | 1 USD |
+| SG90 micro servo | 1 | Lesson 3 | 2 USD |
+| SSD1306 OLED display | 1 | Lesson 5 | 3 to 4 USD |
+| BME280 sensor module | 1 | Lesson 5 | 2 to 3 USD |
+| INA219 current sensor module | 1 | Lesson 6 | 2 USD |
+| Potentiometer (10K) | 1 | Lesson 6 | 0.25 USD |
+| CR2032 battery holder | 1 | Lesson 9 | 0.50 USD |
+| W25Q SPI flash module | 1 | Lesson 9 | 1 to 2 USD |
 
-**Total estimated cost: $20-30** (including Blue Pill and ST-Link)
+**Total estimated cost: 20 to 30 USD** (including Blue Pill and ST-Link)
 
 ## Skill Progression
 
@@ -147,7 +147,7 @@ Complete the ATmega328P course first (recommended)
 ## Getting Started
 
 <Steps>
-1. **Get a Blue Pill board** (STM32F103C8T6) and an **ST-Link V2 clone**. Together they cost under $8.
+1. **Get a Blue Pill board** (STM32F103C8T6) and an **ST-Link V2 clone**. Together they cost under 8 USD.
 
 2. **Install the toolchain**: arm-none-eabi-gcc, OpenOCD, and STM32CubeMX. Lesson 1 covers setup on Linux, macOS, and Windows.
 

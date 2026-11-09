@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-Polling UART byte by byte wastes CPU cycles and drops characters under load. In this lesson you will build a proper serial command shell that receives data through DMA into a circular buffer, detects complete commands using UART idle line detection, and processes them without blocking. The shell gives you a live debugging interface: type a command and the STM32 responds instantly with register values, pin states, or confirmation of your PWM changes. #STM32 #UART #DMA
+A UART holds only one received byte. If the program is busy when the next byte arrives, a byte is lost, and at 115200 baud a new byte arrives every 87 microseconds. A program that checks the UART in its main loop (polling) therefore loses characters as soon as it does real work. In this lesson you build a serial command shell that receives through DMA, hardware that copies each byte into memory without the CPU, and that uses interrupts to know when a whole command has arrived. The shell is then your debugging tool: type a command and the STM32 answers with register values or pin states. #STM32 #UART #DMA
 
 ## What We Are Building
 
 <Card title="Interactive Command Shell over Serial" icon="star">
-A command-line interface running on the Blue Pill that accepts typed commands over UART and executes them in real time. The receive path uses DMA with a circular buffer and idle line detection so no bytes are ever lost, even when the CPU is busy processing a previous command. The transmit path also uses DMA to send long responses without blocking.
+A command line on the Blue Pill that runs commands typed over UART. DMA puts received bytes into a circular buffer (one that starts again at its beginning when full), so none are lost while the CPU works on the previous command. Long answers also go out by DMA, so the program does not wait for each character.
 </Card>
 
 **Project specifications:**
@@ -62,28 +62,28 @@ A command-line interface running on the Blue Pill that accepts typed commands ov
 <InArticleAd />
 
 
-The Nested Vectored Interrupt Controller (NVIC) manages all interrupts on the Cortex-M3. It supports up to 240 external interrupts with programmable priority levels. On the STM32F103, there are 4 bits of priority, but by default only the upper 4 bits are used, giving 16 priority levels (0 being the highest priority). Interrupts with lower priority numbers preempt those with higher numbers.
+An interrupt is a hardware signal that stops the main program for a moment, runs a short function (the handler, or ISR, interrupt service routine), and returns, like a doorbell while you cook. The chip reacts at once without checking in a loop.
+
+When two interrupts want to run together, the NVIC (Nested Vectored Interrupt Controller) in the Cortex-M3 core decides. Each interrupt has a priority number; a lower number is more urgent. The STM32F103 has 16 levels, 0 to 15.
 
 ### Priority Grouping
 
-The NVIC processes interrupts based on their priority number. Lower numbers mean higher urgency. When a higher-priority interrupt fires during a lower-priority ISR, it preempts immediately.
+An interrupt with a lower priority number stops the running handler of one with a higher number. This is called preemption.
 
 ```text
-  NVIC interrupt nesting:
+  Priority 1            +-[DMA RX]-+
+  Priority 2     +-[TX]-+          +-[TX]-+
+  main()    -----+                        +-----
+                 ^      ^          ^      ^
+                 1      2          3      4
 
-  Priority 0 (highest)
-  Priority 1  |  +--[USART1 IDLE]--+
-  Priority 2  |  |  +--[DMA TX]--+ |
-  Priority 3  |  |  |            | |
-              |  |  |            | |
-  main()  ----+--+--+            +-+---
-              ^     ^            ^ ^
-           USART1  DMA_TX     DMA  USART1
-           fires   preempts   done returns
-                   USART1
+  1. The DMA TX interrupt fires: main() stops.
+  2. DMA RX fires. It is more urgent: TX stops.
+  3. RX finishes: TX continues.
+  4. TX finishes: main() continues.
 ```
 
-The 4 priority bits can be split between preemption priority (which interrupts can preempt others) and sub-priority (tie-breaking when two interrupts fire simultaneously):
+The 4 priority bits can be split in two. The preemption priority decides which interrupt can stop another. The sub-priority only orders two that wait at the same moment; it never stops a running handler.
 
 | Group Setting | Preemption Bits | Sub-priority Bits | Preemption Levels |
 |---------------|----------------|-------------------|-------------------|
@@ -92,6 +92,8 @@ The 4 priority bits can be split between preemption priority (which interrupts c
 | Group 2 | 2 | 2 | 4 levels, 4 sub-priorities |
 
 ### Setting Priorities for This Project
+
+Receiving is more urgent than sending: a late answer harms nobody, a lost byte is gone. In `NVIC_EncodePriority(5, 1, 0)` the numbers are the grouping value, the preemption priority and the sub-priority. Both receive interrupts get preemption priority 1, so neither stops the other, and both can stop the transmit interrupt at 2.
 
 ```c
 void nvic_config(void) {
@@ -117,11 +119,9 @@ void nvic_config(void) {
 <InArticleAd />
 
 
-DMA (Direct Memory Access) transfers data between peripherals and memory without CPU involvement. The DMA controller reads from one address and writes to another, incrementing pointers and decrementing the count automatically.
+An interrupt for every byte would stop the CPU 11,520 times a second at 115200 baud. DMA (Direct Memory Access) avoids this: a hardware block that copies data between a peripheral and memory by itself, like a conveyor belt that moves boxes while the worker does other work. Each time the UART has a byte, the DMA controller puts it in the next place of a buffer and reduces a count by one.
 
 ```text
-  DMA transfer: USART1 RX to memory
-
   +----------+     +-----------+     +--------+
   | USART1   |     |  DMA1     |     |  SRAM  |
   | DR reg   |---->| Channel 5 |---->| rx_buf |
@@ -132,11 +132,11 @@ DMA (Direct Memory Access) transfers data between peripherals and memory without
   address fixed,                     address
   no increment                       increments
 
-  In circular mode, CNDTR reloads
-  automatically and CMAR wraps to start.
+  In circular mode the count reloads and
+  writing starts again at the start of rx_buf.
 ```
 
-The CPU sets up the transfer (source address, destination address, byte count, direction) and the DMA controller handles the rest. On the STM32F103, DMA1 has 7 channels, each hardwired to specific peripheral requests. You cannot freely assign any peripheral to any channel.
+The CPU only sets up the transfer: source, destination, number of bytes and direction. DMA1 on the STM32F103 has 7 channels, each wired to fixed peripherals, so you cannot choose: USART1 receive is always channel 5.
 
 ### DMA1 Channel Assignments (Relevant Channels)
 
@@ -166,7 +166,9 @@ Each DMA channel has four key registers:
 
 ### Why Circular Mode
 
-In normal DMA mode, the transfer stops when CNDTR reaches zero, and you must reconfigure the channel to start again. In circular mode, the DMA controller automatically reloads CNDTR and wraps back to the start of the buffer. Combined with UART idle line detection, this gives you a continuous receive path that never misses a byte and never needs to be restarted.
+In normal mode the transfer stops when CNDTR reaches zero, and bytes that arrive before you set up the channel again are lost. In circular mode the DMA controller reloads CNDTR itself and continues at the start of the buffer, so receiving never stops.
+
+One limit remains: the buffer holds 256 bytes. If the program does not read them before 256 more arrive (22 ms of continuous data at 115200 baud), the oldest unread bytes are overwritten.
 
 ### Implementation
 
@@ -197,12 +199,15 @@ void uart_dma_rx_init(void) {
     /* Enable USART1 DMA receiver */
     USART1->CR3 |= USART_CR3_DMAR;
 
-    /* Enable USART1 IDLE line interrupt */
-    USART1->CR1 |= USART_CR1_IDLEIE;
+    /* Enable the receiver (uart_init() from the menu program enabled TX only)
+     * and the USART1 IDLE line interrupt */
+    USART1->CR1 |= USART_CR1_RE | USART_CR1_IDLEIE;
 }
 ```
 
 ### Processing Received Data
+
+The DMA controller writes into the buffer; the program reads from it. CNDTR counts down from 256, so the write position is 256 minus CNDTR. `rx_read_pos` is where the program has read up to, and the bytes between the two positions are waiting.
 
 ```c
 uint16_t uart_dma_available(void) {
@@ -237,29 +242,28 @@ uint16_t uart_dma_read_line(char *dest, uint16_t max_len) {
 
 ### Idle Line Detection
 
-The UART idle line interrupt fires when the RX line has been idle for one frame duration after receiving data. This provides natural message boundary detection.
+The DMA controller does not know when a command is complete; the UART does. Its idle line interrupt fires when the RX line stays quiet for one byte time (87 microseconds here) after data. A terminal sends a command as a group of characters and then nothing, so the silence marks the end.
 
 ```text
-  Idle line detection:
-
   RX line:  ____  __ __ __ __ __  ____________
                  |__|  |__|  |__|
-                 h  e  l  p  \n
-                 <-- data -->  <-- idle -->
-                                    ^
-                               IDLE interrupt
-                               fires here
+                  h  e  l  p  \n
+                 <--- data --->  <-- idle -->
+                                     ^
+                          IDLE interrupt fires here
+```
 
-  DMA circular buffer state:
+At that moment the buffer holds the whole command, between the read position and the write position:
+
+```text
   +---+---+---+---+---+---+---+---+
   | h | e | l | p |\n |   |   |   |
   +---+---+---+---+---+---+---+---+
     ^                   ^
-    read_pos         write_pos
-                     (= 256 - CNDTR)
+    read_pos            write_pos (= 256 - CNDTR)
 ```
 
-This is the perfect trigger for "a complete message has arrived" because most serial terminals send commands as a burst of characters followed by silence. You do not need to poll or wait for a specific delimiter; the idle interrupt tells you when the sender has stopped transmitting.
+The handler only sets a flag, `rx_data_ready`; the main loop does the slow work of reading the command. Keep every handler this short, so other interrupts are not delayed.
 
 ```c
 volatile uint8_t rx_data_ready = 0;
@@ -290,11 +294,15 @@ void DMA1_Channel5_IRQHandler(void) {
 
 <InArticleAd />
 
+Sending is the same transfer in the other direction: give the text address and length, then enable the channel. In normal mode it stops after the last byte, and its interrupt clears `tx_busy`. The text must not change until then, because the DMA controller is still reading it.
 
 ```c
 volatile uint8_t tx_busy = 0;
 
 void uart_dma_tx_init(void) {
+    /* Enable DMA1 clock (harmless if it is already on) */
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
+
     /* DMA1 Channel 4 for USART1 TX */
     DMA1_Channel4->CCR = 0;
 
@@ -362,7 +370,7 @@ void cmd_help(void) {
         "\r\n=== STM32 Command Shell ===\r\n"
         "Commands:\r\n"
         "  help              Show this help\r\n"
-        "  pwm <ch> <duty>   Set TIM2 channel PWM (0-100%%)\r\n"
+        "  pwm <ch> <duty>   Set TIM2 channel PWM (0-100%)\r\n"
         "  read <port><pin>  Read GPIO pin (e.g., read A5)\r\n"
         "  dump <periph>     Dump registers (RCC, GPIOA, TIM2)\r\n"
         "  reset             Software reset\r\n\r\n";
@@ -409,7 +417,7 @@ void cmd_read_pin(const char *args) {
         case 'C': case 'c': port = GPIOC; break;
     }
 
-    if (!port || pin > 15) {
+    if (!port || pin < 0 || pin > 15) {
         const char *err = "Error: read <A-C><0-15>\r\n";
         uart_dma_send(err, strlen(err));
         return;
@@ -459,6 +467,7 @@ void process_command(const char *cmd) {
 
 <InArticleAd />
 
+The main loop works only when the flag says a command has arrived. Between commands, `__WFI()` (wait for interrupt) stops the CPU until the next interrupt, which saves power.
 
 ```c
 int main(void) {
@@ -488,6 +497,9 @@ int main(void) {
             while (uart_dma_available() > 0) {
                 uint16_t len = uart_dma_read_line(cmd_buf, sizeof(cmd_buf));
                 if (len > 0) {
+                    /* Do not overwrite tx_buf while DMA is still sending it */
+                    while (tx_busy);
+
                     /* Echo the command */
                     int echo_len = snprintf(tx_buf, sizeof(tx_buf),
                         "> %s\r\n", cmd_buf);
@@ -526,33 +538,33 @@ Connect PA9 to your serial adapter's RX and PA10 to its TX (cross-connect). Open
 <InArticleAd />
 
 
-<Card title="Lesson 4 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
-**Interrupt knowledge:**
-- NVIC priority grouping and how preemption vs. sub-priority works
-- Setting interrupt priorities for multiple peripherals
-- Proper interrupt flag clearing sequences
+**Interrupts:**
+- Preemption priority and sub-priority in the NVIC
+- Priorities for several peripherals
+- Clearing each interrupt flag in its handler
 
-**DMA skills:**
-- DMA channel assignments and the fixed peripheral-to-channel mapping
-- Circular mode for continuous receive without CPU intervention
-- Normal mode for transmit with completion interrupt
-- DMA configuration registers (CCR, CNDTR, CPAR, CMAR)
+**DMA:**
+- Each peripheral has a fixed DMA channel
+- Circular mode for receiving without a stop
+- Normal mode for sending, with an interrupt at the end
+- The registers CCR, CNDTR, CPAR and CMAR
 
-**UART skills:**
-- UART idle line detection for message framing
-- DMA-based receive into circular buffer with no lost bytes
-- DMA-based transmit for non-blocking serial output
-- Command parser architecture for embedded shells
+**UART:**
+- The idle line marks the end of a command
+- Receiving by DMA into a circular buffer, and its 256 byte limit
+- Sending by DMA without waiting for each character
+- A command parser for a shell
 
 **System design:**
-- Using __WFI() for low-power idle when no work is pending
-- Separating receive buffering from command processing
-- Building a debugging interface into firmware from the start
+- `__WFI()` stops the CPU when there is no work
+- Short handlers, with the slow work in the main loop
+- A debugging interface built into the firmware from the start
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 5: SPI and I2C: HAL vs Register Level](/education/embedded-programming-stm32/spi-i2c-hal-register-access), you will connect an SSD1306 OLED and BME280 sensor, writing the same driver two ways (HAL and bare registers) to understand the tradeoffs in code size, speed, and readability.
+In [SPI and I2C: HAL vs Register Level](/education/embedded-programming-stm32/spi-i2c-hal-register-access/), you will connect an SSD1306 OLED display and a BME280 sensor, and write the drivers two ways, with ST's HAL library and with registers, to compare code size, speed and readability.
 :::
 
 <EmbeddedProgrammingStm32Comments />

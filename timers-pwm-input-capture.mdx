@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-Servos expect a very specific PWM signal: a pulse every 20 ms, with the pulse width encoding the target angle. Getting this right requires precise timer configuration, and the STM32 timer subsystem is one of the most capable (and complex) peripherals on the chip. In this lesson you will generate servo-grade PWM, read an encoder using the timer's built-in hardware encoder mode, and combine both into a smooth pan mechanism that tracks your finger on the knob. #STM32 #Timers #PWM
+A hobby servo that receives a slightly wrong signal shakes, turns to the wrong angle, or does not move. It wants one pulse every 20 ms, and the width of that pulse, between 0.5 ms and 2.5 ms, is the angle it turns to. Software delays cannot hold that timing while the program does other work. A timer can. In this lesson you generate the servo signal with one timer, count encoder steps with another, and join both in a pan mechanism that follows the knob. #STM32 #Timers #PWM
 
 ## What We Are Building
 
 <Card title="Servo Pan Mechanism with Encoder Control" icon="star">
-A servo motor that pans left and right based on rotary encoder input. The encoder is read using TIM3's hardware encoder interface (no software polling needed), and the servo is driven by TIM2's PWM output. Rotating the encoder clockwise pans the servo right; counterclockwise pans it left. The position is displayed on the serial terminal along with the raw encoder count and servo pulse width.
+A servo that pans right when the encoder turns clockwise and left when it turns counterclockwise. TIM3's hardware encoder interface reads the encoder (no software polling) and TIM2's PWM output drives the servo. The serial terminal shows the position, the raw encoder count and the pulse width.
 </Card>
 
 **Project specifications:**
@@ -51,11 +51,11 @@ A servo motor that pans left and right based on rotary encoder input. The encode
 
 | Component | Quantity | Notes |
 |-----------|----------|-------|
-| Blue Pill (STM32F103C8T6) | 1 | From previous lessons |
-| ST-Link V2 clone | 1 | From previous lessons |
-| SG90 micro servo | 1 | 4.8-6V operating voltage |
-| KY-040 rotary encoder | 1 | From Lesson 2 |
-| Breadboard + jumper wires | 1 set | From previous lessons |
+| Blue Pill (STM32F103C8T6) | 1 | As before |
+| ST-Link V2 clone | 1 | As before |
+| SG90 micro servo | 1 | 4.8 to 6V operating voltage |
+| KY-040 rotary encoder | 1 | The one used for the menu |
+| Breadboard + jumper wires | 1 set | As before |
 | External 5V supply (optional) | 1 | For servo power if USB is insufficient |
 
 ## STM32 Timer Overview
@@ -63,23 +63,27 @@ A servo motor that pans left and right based on rotary encoder input. The encode
 <InArticleAd />
 
 
-The STM32F103 has seven timers, each with different capabilities. Understanding which timer to use for which task is essential for efficient peripheral allocation. All timers share a common counting core but differ in channel count, resolution, and special features.
+A timer is a counter driven by a clock, like a runner who takes one step per tick and runs laps. So one circuit can make a signal with exact timing (PWM), measure an incoming signal (input capture), or count pulses from outside (encoder mode). A channel is one pin connection of a timer, used as an output or an input.
+
+The STM32F103 family timers are below; the STM32F103C8 on the Blue Pill has TIM1 to TIM4.
 
 | Timer | Type | Channels | Resolution | Special Features |
 |-------|------|----------|------------|-----------------|
-| TIM1 | Advanced | 4 | 16-bit | Complementary outputs, dead-time, break input |
+| TIM1 | Advanced | 4 | 16-bit | Extra outputs and safety inputs for motor drives |
 | TIM2 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
 | TIM3 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
 | TIM4 | General-purpose | 4 | 16-bit | Encoder mode, PWM, input capture |
-| TIM5 | General-purpose | 4 | 16-bit | (Not on all F103 variants) |
-| TIM6 | Basic | 0 | 16-bit | DAC trigger, timebase only |
-| TIM7 | Basic | 0 | 16-bit | DAC trigger, timebase only |
+| TIM5 | General-purpose | 4 | 16-bit | (High-density F103 parts only, not on the Blue Pill) |
+| TIM6 | Basic | 0 | 16-bit | DAC trigger, timebase only (high-density parts only) |
+| TIM7 | Basic | 0 | 16-bit | DAC trigger, timebase only (high-density parts only) |
 
 ### Timer Clock Source
 
-TIM2, TIM3, and TIM4 are on the APB1 bus, which runs at 36 MHz. However, when the APB1 prescaler is greater than 1 (which it is, since we divide by 2 to get 36 MHz from 72 MHz), the timer clock is automatically doubled to 72 MHz. This means all general-purpose timers run at 72 MHz despite being on the 36 MHz APB1 bus. TIM1, being on APB2, also runs at 72 MHz directly.
+Every time a timer makes depends on its clock frequency. TIM2, TIM3 and TIM4 are on the 36 MHz APB1 bus, but when the APB1 prescaler divides by more than 1 (here by 2), the chip doubles the timer clock, so they count from 72 MHz. TIM1 is on APB2, also 72 MHz.
 
 ### Timer Counting Modes
+
+The counter runs between 0 and the auto-reload register (ARR) value, then starts again, so ARR sets the period. This lesson counts up.
 
 ```
 Up-counting:    0 -> 1 -> 2 -> ... -> ARR -> 0 -> 1 -> ...
@@ -92,32 +96,29 @@ Center-aligned: 0 -> 1 -> ... -> ARR -> ARR-1 -> ... -> 0 -> 1 -> ...
 <InArticleAd />
 
 
-A standard hobby servo expects a PWM signal with a 20 ms period (50 Hz). The pulse width within that period determines the shaft angle.
+PWM (pulse width modulation) repeats with a fixed period and is high for part of each period. A hobby servo expects 20 ms (50 Hz), and the pulse width sets the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), 2.5 ms for 180 degrees. These values are safe for nearly all servos, the SG90 included.
 
 ```text
-  Servo PWM signal:
+  |<------------- 20 ms ------------->|
+   ___                                 ___
+  |   |_______________________________|   |____
+  pulse                               next pulse
 
-  |<----------- 20 ms (50 Hz) ---------->|
-
-  0 deg:     ___                           ___
-            |   |                         |   |
-  __________| 0.5ms |_____________________| 0.5ms
-            |<->|
-
-  90 deg:    ______                        ___
-            |      |                      |
-  __________| 1.5ms  |___________________| 1.5
-            |<---->|
-
-  180 deg:   _________                     ___
-            |         |                   |
-  __________| 2.5ms     |________________| 2.5
-            |<------->|
+  Width of the pulse     Angle
+  0.5 ms                 0 degrees
+  1.5 ms                 90 degrees
+  2.5 ms                 180 degrees
 ```
 
-The pulse width within that period controls the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), and 2.5 ms for 180 degrees. Some servos accept a slightly wider range, but these values are safe for nearly all servos including the SG90.
-
 ### PWM Configuration
+
+Three registers of the timer make this signal:
+
+- `PSC` (prescaler) divides the 72 MHz clock by 72, so the counter advances once each microsecond.
+- `ARR` is 19,999, so one period is 20,000 counts: 20 ms.
+- `CCR1` (compare register) is the pulse width in microseconds. The pin is high while the counter is below `CCR1`, so `CCR1 = 1500` gives a 1.5 ms pulse.
+
+`PSC` and `ARR` hold the wanted number minus 1 (the hardware counts from 0). With preload, a new value waits until the counter starts again, so no pulse is cut in the middle.
 
 ```c
 void servo_pwm_init(void) {
@@ -164,7 +165,7 @@ void servo_set_angle(uint16_t angle_degrees) {
 
 ### PWM Output Compare Modes
 
-The STM32 timers support several output compare modes beyond basic PWM:
+A match is the moment the counter equals the compare value. PWM is one of eight things the output can do at a match. The OC1M bits choose, and the code above writes 110:
 
 | Mode | OC1M bits | Behavior |
 |------|-----------|----------|
@@ -182,34 +183,24 @@ The STM32 timers support several output compare modes beyond basic PWM:
 <InArticleAd />
 
 
-In Lesson 2 we read the encoder in software by polling GPIO pins. The STM32 timers offer a much better approach: encoder mode. The timer hardware counts directly from the quadrature signals without CPU intervention.
+The menu program polled the encoder pins in the main loop, so steps were lost whenever the loop was busy. In encoder mode the timer hardware watches both signals and moves its counter up or down by itself.
 
 ```text
-  Hardware encoder mode (TIM3):
+  +---------+         +-----------------------+
+  | Encoder |         | TIM3                  |
+  |   CLK --+--PA6--->| TI1   encoder         |
+  |   DT  --+--PA7--->| TI2   logic --> CNT   |
+  +---------+         +-----------------------+
 
-  PA6 (TIM3_CH1) ----> TI1 input
-  PA7 (TIM3_CH2) ----> TI2 input
-
-  +--------+     +---------------+
-  |Encoder |     |     TIM3      |
-  | CLK ---+---->| TI1  Encoder  |
-  | DT  ---+---->| TI2  logic    |
-  +--------+     |       |       |
-                 |   +---+---+   |
-                 |   | CNT   |   |
-                 |   | (auto |   |
-                 |   | inc/  |   |
-                 |   | dec)  |   |
-                 |   +-------+   |
-                 +---------------+
-
-  CPU reads TIM3->CNT for position.
-  Zero CPU overhead during counting.
+  CNT rises in one direction and falls in the other.
+  The program reads CNT when it wants the position.
 ```
 
-In this mode, the timer counter automatically increments or decrements based on the quadrature signals, with no CPU intervention needed. You simply read the timer's CNT register to get the current position. This eliminates missed steps during heavy CPU load and is the standard approach in motor control applications.
+No step is lost when the CPU is busy, which is why motor control uses this mode.
 
 ### Encoder Mode Configuration
+
+Three choices need a reason. Encoder mode 3 counts every edge of both signals, so one KY-040 click gives 4 counts. The input filter accepts an edge only after 8 equal samples, which removes contact bounce. The counter starts at 32,768, the middle of its 16-bit range, so it can move both ways without passing zero.
 
 ```c
 void encoder_hw_init(void) {
@@ -235,7 +226,7 @@ void encoder_hw_init(void) {
     TIM3->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
     TIM3->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0;
 
-    /* Input filter: 4 samples at fDTS/2 (debouncing) */
+    /* Input filter: IC1F = IC2F = 0011, 8 samples at fCK_INT (glitch rejection) */
     TIM3->CCMR1 |= (0x3 << 4) | (0x3 << 12);
 
     /* Set auto-reload to maximum for free-running counter */
@@ -257,7 +248,7 @@ int16_t encoder_hw_read(void) {
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| Software polling (Lesson 2) | Simple, any GPIO pin | Misses steps under load, uses CPU |
+| Software polling (the menu program) | Simple, any GPIO pin | Misses steps under load, uses CPU |
 | Hardware encoder mode | Zero CPU usage, never misses steps | Requires specific timer pins |
 | External interrupt (EXTI) | Works on any EXTI pin | Interrupt overhead, possible missed edges |
 
@@ -266,11 +257,9 @@ int16_t encoder_hw_read(void) {
 <InArticleAd />
 
 
-Input capture records the timer counter value at the moment an external signal edge occurs. By comparing two successive captures, you get the signal period.
+Input capture is the opposite of PWM: the timer measures a signal from outside. When an edge arrives, the hardware copies the counter into the capture register, like a photo of a clock, so the time is exact even if the program reads it later. Two captures in a row give the period.
 
 ```text
-  Input capture for period measurement:
-
   Signal: _____       _________       ____
                |     |         |     |
                |_____|         |_____|
@@ -284,9 +273,11 @@ Input capture records the timer counter value at the moment an external signal e
   Frequency = 1 / 0.005 = 200 Hz
 ```
 
-This is useful for measuring pulse widths, signal frequencies, and time intervals between events. While we do not use input capture in the servo project, understanding it completes the timer peripheral picture and prepares you for sensor interfacing in later lessons.
+Input capture measures pulse widths, frequencies and the time between events. The servo project does not use it, but many sensors need it.
 
 ### Measuring a Signal Period
+
+The 16-bit counter returns to 0 after 65,535; the `& 0xFFFF` in the handler keeps the difference correct when that happens between two captures. At 1 microsecond per count, the longest period this code can measure is 65.5 ms.
 
 ```c
 volatile uint32_t capture_value = 0;
@@ -325,7 +316,7 @@ void TIM4_IRQHandler(void) {
         TIM4->SR &= ~TIM_SR_CC1IF;
 
         capture_value = TIM4->CCR1;
-        period_ticks = capture_value - last_capture;
+        period_ticks = (capture_value - last_capture) & 0xFFFF;  /* 16-bit counter wraps */
         last_capture = capture_value;
     }
 }
@@ -337,6 +328,8 @@ void TIM4_IRQHandler(void) {
 
 
 ### Main Application
+
+The loop reads the encoder count and moves the servo 2 degrees for each count. One click of the knob is 4 counts, so it turns the servo 8 degrees.
 
 ```c
 #include "stm32f103xb.h"
@@ -389,7 +382,7 @@ int main(void) {
         if (delta != 0) {
             last_encoder = enc_pos;
 
-            /* Each encoder step moves servo by 2 degrees */
+            /* Each encoder count moves servo by 2 degrees (4 counts per detent) */
             int16_t new_angle = (int16_t)servo_angle + (delta * 2);
             if (new_angle < 0) new_angle = 0;
             if (new_angle > 180) new_angle = 180;
@@ -436,7 +429,7 @@ int main(void) {
 | GND | Common ground (servo, encoder, serial) |
 
 :::caution[Servo power]
-The SG90 draws up to 500 mA under load. USB power from the Blue Pill may be insufficient, especially if the servo stalls. For reliable operation, power the servo from a separate 5V supply with its ground connected to the Blue Pill's ground.
+PA0 carries only the signal: a pin gives about 8 mA at most, and the SG90 draws up to 500 mA under load, so motor power comes from the red 5V wire. USB power through the Blue Pill may not be enough, especially if the servo stalls. Use a separate 5V supply with its ground joined to the Blue Pill ground.
 :::
 
 :::tip[Instrument it]
@@ -448,30 +441,30 @@ Input capture and the encoder interface are not just motor-control plumbing, the
 <InArticleAd />
 
 
-<Card title="Lesson 3 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
-**Timer knowledge:**
-- STM32 timer types (advanced, general-purpose, basic) and their capabilities
-- Timer clock source derivation from APB buses with automatic doubling
+**Timers:**
+- Timer types (advanced, general-purpose, basic)
+- The timer clock is 72 MHz, also on the 36 MHz APB1 bus
 - Counting modes (up, down, center-aligned)
 
-**PWM skills:**
-- Configured 50 Hz servo PWM with microsecond-level pulse width control
-- Output compare modes and when to use each
-- Preload registers and update events for glitch-free PWM changes
+**PWM:**
+- 50 Hz servo PWM with the pulse width set in microseconds
+- Output compare modes
+- Preload, so that no pulse is cut in the middle
 
-**Input capture skills:**
-- Timer input capture for measuring signal periods and pulse widths
-- Capture interrupt handling in the IRQ handler
+**Input capture:**
+- Measuring a period from two captures
+- Handling the capture interrupt and the return of the counter to 0
 
 **Encoder interface:**
-- Hardware encoder mode that counts quadrature signals without CPU intervention
-- Input filtering for debouncing mechanical encoders
-- Comparison of software polling vs. hardware encoder mode
+- Encoder mode counts quadrature signals without the CPU
+- The input filter removes contact bounce
+- Software polling against hardware encoder mode
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 4: UART with DMA and Interrupts](/education/embedded-programming-stm32/uart-dma-interrupts), you will build an interactive command shell that can set PWM values, read pins, and dump registers over serial. You will learn NVIC priorities, DMA channels, circular buffers, and idle line detection for efficient serial communication.
+In [UART with DMA and Interrupts](/education/embedded-programming-stm32/uart-dma-interrupts/), you will build a command shell that sets PWM values, reads pins and prints registers over a serial link, and that receives bytes without losing them while the CPU is busy.
 :::
 
 <EmbeddedProgrammingStm32Comments />

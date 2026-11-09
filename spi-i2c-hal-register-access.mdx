@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-Every STM32 project eventually needs to communicate with external chips over SPI or I2C, and every developer faces the same question: use ST's HAL library or write register-level code? In this lesson you will answer that question with data. You will wire up an SSD1306 OLED display (SPI) and a BME280 environmental sensor (I2C), write both drivers at the register level and with HAL, then measure the differences in flash usage, RAM footprint, and transaction speed. #STM32 #SPI #I2C
+A sensor or a display is a separate chip that the microcontroller talks to over a few shared wires. Two buses do most of this work, SPI and I2C, and each fails quietly: a blank display, or a program that waits for ever for an answer. You must also choose between ST's ready library (HAL) and your own register code. In this lesson you connect an SSD1306 OLED display over SPI and a BME280 environmental sensor over I2C, write the drivers both ways, and compare their size and speed. #STM32 #SPI #I2C
 
 ## What We Are Building
 
 <Card title="Sensor Dashboard on OLED Display" icon="star">
-A real-time dashboard showing temperature, humidity, and pressure readings from a BME280 sensor on a 128x64 SSD1306 OLED display. The OLED is connected over SPI for fast screen updates, and the BME280 communicates over I2C. Both drivers exist in HAL and register-level versions so you can switch between them at compile time and compare the results.
+A real-time dashboard of temperature, humidity and pressure from a BME280 sensor (on I2C) on a 128x64 SSD1306 OLED display (on SPI, for fast screen updates). Both drivers exist in HAL and register-level versions, chosen at compile time, so you can compare them.
 </Card>
 
 **Project specifications:**
@@ -44,49 +44,52 @@ A real-time dashboard showing temperature, humidity, and pressure readings from 
 | I2C peripheral | I2C1 (SCL: PB6, SDA: PB7) |
 | I2C address | 0x76 (BME280 with SDO tied to GND) |
 | SPI clock | 18 MHz (APB2 / 4) |
-| I2C speed | 400 kHz (Fast mode) |
+| I2C speed | Fast mode (400 kHz maximum, 360 kHz with a 36 MHz APB1 clock) |
 | Update rate | 2 Hz (read sensor, update display) |
 
 ### Bill of Materials
 
 | Component | Quantity | Notes |
 |-----------|----------|-------|
-| Blue Pill (STM32F103C8T6) | 1 | From previous lessons |
-| ST-Link V2 clone | 1 | From previous lessons |
+| Blue Pill (STM32F103C8T6) | 1 | As before |
+| ST-Link V2 clone | 1 | As before |
 | SSD1306 OLED 128x64 (SPI version) | 1 | 7-pin module (VCC, GND, SCK, SDA, RES, DC, CS) |
 | BME280 breakout module | 1 | I2C mode (SDO to GND for address 0x76) |
-| Breadboard + jumper wires | 1 set | From previous lessons |
+| Breadboard + jumper wires | 1 set | As before |
 
 ## SPI on the STM32F103
 
 <InArticleAd />
 
 
-The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus (72 MHz max) and SPI2 on APB1 (36 MHz max).
+SPI (Serial Peripheral Interface) is the simple, fast bus. The microcontroller, the master, makes a clock on one wire and sends one bit on another at each tick. Each chip has its own select wire, like a private phone line, and the master pulls it low to say "this is for you". SPI runs at many megahertz, at the cost of one more wire per chip.
+
+- SCK: the clock, made by the master
+- MOSI: data from master to chip (master out, slave in)
+- MISO: data from chip to master (not used by the display)
+- CS: chip select, active low
 
 ```text
-  SPI1 wiring to SSD1306 OLED:
-
   Blue Pill              SSD1306 OLED
   +----------+           +----------+
-  |          |           |          |
   | PA5 SCK -+---------->| D0 CLK   |
   | PA7 MOSI-+---------->| D1 MOSI  |
   | PA4 CS  -+---------->| CS       |
   | PA3 DC  -+---------->| DC       |
   | PA2 RST -+---------->| RES      |
-  |          |           |          |
   | 3.3V ----+---------->| VCC      |
-  | GND -----+---------->| GND      |
+  | GND -----+-----------| GND      |
   +----------+           +----------+
 
   DC pin: LOW = command, HIGH = data
   CS pin: LOW = selected (active)
 ```
 
-SPI1 can run at up to 18 MHz in master mode (72 MHz / 4), which is plenty fast for driving OLED displays. SPI is a synchronous, full-duplex protocol with four signals: SCK (clock), MOSI (master out, slave in), MISO (master in, slave out), and CS (chip select, active low).
+The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus and SPI2 on APB1. We run SPI1 at 18 MHz ($72\ \text{MHz} / 4$), which is fast enough for an OLED display.
 
 ### SPI Configuration Registers
+
+Two control registers, one status register, one data register. To send a byte, the code waits for an empty transmit register (TXE) and writes DR. SPI receives one byte for each byte sent, so the code also waits for RXNE and reads DR. CPOL and CPHA choose the clock edge on which data is read; both chips must use the same setting.
 
 | Register | Key Fields |
 |----------|-----------|
@@ -141,6 +144,8 @@ void spi1_send_buf(const uint8_t *buf, uint16_t len) {
 
 ### HAL SPI Driver (Comparison)
 
+HAL (hardware abstraction layer) is ST's library. You fill a structure with named settings and call one function, and HAL writes the same registers for you.
+
 ```c
 /* Using STM32 HAL */
 SPI_HandleTypeDef hspi1;
@@ -167,7 +172,9 @@ HAL_SPI_Transmit(&hspi1, buf, len, HAL_MAX_DELAY);
 <InArticleAd />
 
 
-The SSD1306 is a common OLED controller with a 128x64 pixel monochrome display. In SPI mode it uses a DC (data/command) pin to distinguish between commands (DC low) and display data (DC high). The initialization sequence configures the display timing, contrast, memory addressing mode, and turns the display on. After initialization, you write pixel data as a 1024-byte framebuffer (128 columns x 8 pages, each page is 8 pixels tall).
+The SSD1306 controls a common one-color 128x64 pixel OLED display. One data wire carries two kinds of byte, so a DC (data/command) pin says which: low for a command, high for pixel data. Initialization is a list of commands from the datasheet.
+
+The program then draws into a framebuffer, a copy of the screen in RAM with one bit per pixel: 128 x 64 / 8 = 1024 bytes. `oled_update()` sends all of it to the display.
 
 ### Initialization
 
@@ -261,40 +268,42 @@ void oled_string(uint8_t x, uint8_t y, const char *str);
 <InArticleAd />
 
 
-The I2C1 peripheral connects to the BME280 sensor. Both SDA and SCL are open-drain with external pull-ups provided by the BME280 breakout board.
+I2C (Inter-Integrated Circuit) connects many chips with two wires, SCL (clock) and SDA (data), and no select wires. Each chip has an address, and every message begins with the address of the chip wanted, like a call on a shared radio channel that starts with a name. I2C is slower than SPI (400 kHz at most here) but uses fewer pins.
+
+Both lines are open-drain: a chip can only pull a line low, and a resistor (a pull-up) pulls it high again. So several chips can share the lines, and two pulling at once does no harm.
 
 ```text
-  I2C1 wiring to BME280:
+  Blue Pill                   BME280
+  +----------+              +----------+
+  | PB6 SCL -+------o------>| SCL      |
+  | PB7 SDA -+------o<----->| SDA      |
+  | GND -----+--------------| GND, SDO |
+  | 3.3V ----+------------->| VCC, CSB |
+  +----------+              +----------+
 
-  Blue Pill              BME280
-  +----------+           +----------+
-  |          |     VCC   |          |
-  |          |      |    |          |
-  |          |    [4.7K] |          |
-  |          |      |    |          |
-  | PB6 SCL -+------+-->| SCL      |
-  |          |           |          |
-  |          |     VCC   |          |
-  |          |      |    |          |
-  |          |    [4.7K] |          |
-  |          |      |    |          |
-  | PB7 SDA -+------+-<>| SDA      |
-  |          |           |          |
-  | GND -----+--------->| GND SDO  |
-  | 3.3V ----+--------->| VCC CSB  |
-  +----------+           +----------+
-
-  SDO to GND: address = 0x76
-  SDO to VCC: address = 0x77
+  o = a 4.7k resistor from this line to 3.3V
+      (already on the BME280 module)
+  SDO to GND: address 0x76
+  SDO to VCC: address 0x77
 ```
 
-The STM32F103 I2C peripheral is notoriously tricky at the register level. It has known silicon errata (especially around the BUSY flag getting stuck) and requires careful sequencing of register reads and writes. This is one area where HAL genuinely saves debugging time. We will implement both approaches so you can see the complexity difference firsthand.
+The STM32F103 I2C peripheral is hard to use at register level: it has known hardware faults (errata), such as a BUSY flag that stays set, and needs register accesses in an exact order. Here HAL saves real debugging time.
 
 ### I2C Pin Configuration
 
-I2C pins must be configured as alternate function open-drain. The STM32's internal pull-ups are too weak for I2C; the BME280 module typically includes 4.7k pull-up resistors on board.
+I2C pins must be configured as alternate function open-drain. The pull-ups inside the STM32 are too weak for I2C, so the 4.7k resistors on the BME280 module do this work.
 
 ### Register-Level I2C Driver
+
+Reading one register of the sensor takes five steps on the bus:
+
+1. START: the master pulls SDA low while SCL is high.
+2. The address byte: the 7-bit address shifted left one place, plus 0 for write or 1 for read (0x76 gives 0xEC). The chip with that address answers ACK (acknowledge) by pulling SDA low for one bit.
+3. The number of the sensor register wanted.
+4. A second START and the address again, now with the read bit (0xED).
+5. The sensor sends the data byte. The master answers NACK (no acknowledge: "that was the last byte") and sends STOP.
+
+Each `while` line waits for the flag of one step. If the chip does not answer, the flag never comes and this simple code waits for ever; a driver for real use needs a timeout.
 
 ```c
 void i2c1_init(void) {
@@ -314,7 +323,7 @@ void i2c1_init(void) {
     I2C1->CR2 = 36;               /* APB1 frequency in MHz */
     I2C1->CCR = I2C_CCR_FS        /* Fast mode */
               | I2C_CCR_DUTY      /* 16:9 duty cycle */
-              | 4;                /* CCR value for 400 kHz */
+              | 4;                /* 36 MHz / (25 * 4) = 360 kHz (CCR = 3 would give 480 kHz) */
     I2C1->TRISE = 11;             /* Max rise time: (300ns / 27.7ns) + 1 */
 
     I2C1->CR1 |= I2C_CR1_PE;     /* Enable I2C */
@@ -403,6 +412,8 @@ void i2c1_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 
 ### HAL I2C Driver (Comparison)
 
+HAL does all five steps in one call, and the call has a timeout.
+
 ```c
 I2C_HandleTypeDef hi2c1;
 
@@ -426,6 +437,8 @@ HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1, reg, I2C_MEMADD_SIZE_8BIT,
 
 
 ### Reading Calibration and Sensor Data
+
+The raw sensor numbers are not degrees. Each BME280 holds its own factory correction numbers (calibration data), which the driver reads once and uses in the datasheet formula. The code below converts only the temperature; pressure and humidity are fixed placeholder values until you add their formulas from the Bosch reference code.
 
 ```c
 #define BME280_ADDR 0x76
@@ -497,42 +510,48 @@ void bme280_read(int32_t *temp_c100, uint32_t *press_pa, uint32_t *hum_q10) {
 <InArticleAd />
 
 
-The project uses both SPI and I2C buses simultaneously, each talking to a different peripheral. The STM32 CPU orchestrates both without conflicts because they are independent hardware blocks.
+The project uses both buses, each with its own chip. SPI1 and I2C1 are separate hardware blocks, so they do not disturb each other.
 
 ```text
-  Dual-bus architecture:
-
-            STM32F103
-  +---------------------------+
-  |                           |
-  |  SPI1 (18 MHz)            |
-  |    PA5 SCK  ----+         |
-  |    PA7 MOSI ----+--> SSD1306
-  |    PA4 CS   ----+    OLED
-  |    PA3 DC   ----+   (display)
-  |                           |
-  |  I2C1 (400 kHz)           |
-  |    PB6 SCL  ----+         |
-  |    PB7 SDA  ----+--> BME280
-  |                  |   (sensor)
-  +---------------------------+
+       STM32F103
+  +-----------------+
+  | SPI1, 18 MHz    |  SCK, MOSI, CS, DC
+  | PA5 PA7 PA4 PA3 +-------------------> SSD1306 OLED
+  |                 |
+  | I2C1, 360 kHz   |  SCL, SDA
+  | PB6 PB7         +<------------------> BME280 sensor
+  +-----------------+
 ```
 
-After building both versions, here is what we measured on a real Blue Pill:
+With both versions built on a Blue Pill, the two compare like this:
 
 | Metric | Register Level | HAL |
 |--------|---------------|-----|
 | Flash usage (full project) | ~4.2 KB | ~12.8 KB |
 | RAM usage | ~1.2 KB | ~1.8 KB |
 | SPI byte transfer time | ~0.5 us | ~1.2 us |
-| I2C single register read | ~28 us | ~45 us |
-| I2C burst read (8 bytes) | ~85 us | ~120 us |
+| I2C single register read | ~110 us | ~110 us, set by the bus |
+| I2C burst read (8 bytes) | ~280 us | ~280 us, set by the bus |
 | Lines of driver code | ~180 | ~40 |
 | Debug difficulty | Higher (must know registers) | Lower (descriptive API) |
 
+The two I2C rows are calculated, not measured. At 360 kHz one bit takes 2.8 microseconds, and a byte with its acknowledge is 9 bits. A single register read moves 4 bytes, so it takes at least 36 x 2.8 = 100 microseconds. On a slow bus the bus sets the time, not the driver.
+
 ### When to Use Which
 
-Use register-level code when flash space is critical (bootloaders, tiny chips), when you need maximum speed (bit-banging, real-time control), or when you want deep understanding of the peripheral. Use HAL when development speed matters more than binary size, when your team needs readable and portable code, or when you are prototyping and may switch STM32 families later. Many professional projects use a mix: HAL for complex peripherals (USB, Ethernet) and register access for simple, performance-critical paths (GPIO toggling, tight timer loops).
+Use register-level code when:
+
+- flash space is short (bootloaders, very small chips)
+- a fast path needs the most speed (switching a pin, a tight timer loop)
+- you want to understand the peripheral
+
+Use HAL when:
+
+- development time matters more than program size
+- the team needs readable code that moves easily to another STM32 family
+- the peripheral is complex (USB, Ethernet) or has known faults, as I2C has here
+
+Many professional projects mix the two.
 
 ## Dashboard Main Loop
 
@@ -595,30 +614,29 @@ int main(void) {
 <InArticleAd />
 
 
-<Card title="Lesson 5 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
-**SPI skills:**
-- SPI peripheral configuration at register level (CR1, CR2, SR, DR)
-- Master mode, clock prescaler, CPOL/CPHA settings
-- Software chip select management
-- HAL SPI initialization and transmit for comparison
+**SPI:**
+- A clock, a data wire and one select wire for each chip
+- SPI setup at register level (CR1, CR2, SR, DR)
+- Chip select driven by software
+- The same setup with HAL
 
-**I2C skills:**
-- I2C peripheral configuration for 400 kHz fast mode
-- Register-level START, address, data, STOP sequence
-- Burst reads with ACK/NACK management
-- Known STM32F103 I2C errata and workarounds
-- HAL I2C memory read for comparison
+**I2C:**
+- Two shared open-drain wires, and an address for each chip
+- START, address, data, STOP at register level
+- ACK and NACK in a burst read
+- The I2C peripheral of the F103 has known faults
+- The same read with one HAL call
 
-**Driver development:**
-- SSD1306 OLED initialization sequence and framebuffer rendering
-- BME280 calibration data reading and temperature compensation
-- Measured comparison of HAL vs register-level code (size, speed, complexity)
-- Guidelines for choosing HAL vs registers in real projects
+**Drivers:**
+- SSD1306 initialization and the framebuffer
+- BME280 calibration data and temperature conversion
+- HAL against register code: size, speed, effort
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 6: ADC with DMA and Analog Watchdog](/education/embedded-programming-stm32/adc-dma-analog-watchdog), you will build a voltage and current monitor using an INA219 sensor and the STM32's built-in ADC with multi-channel DMA scanning and analog watchdog threshold alerts.
+In [ADC with DMA and Analog Watchdog](/education/embedded-programming-stm32/adc-dma-analog-watchdog/), you will build a voltage and current monitor with the ADC (analog to digital converter) of the STM32, and let the hardware raise an alert when a reading passes a limit.
 :::
 
 <EmbeddedProgrammingStm32Comments />

@@ -25,12 +25,12 @@ import { Card, CardGrid, Badge, Steps, LinkButton, FileTree } from '@astrojs/sta
 
 import EmbeddedProgrammingStm32Comments from '../../../../components/embedded-programming-stm32/EmbeddedProgrammingStm32Comments.astro';
 
-When embedded firmware misbehaves, you cannot just add print statements and re-run. The bug might be a stack overflow that corrupts memory silently, a HardFault triggered by a null pointer dereference, or a race condition between an interrupt and the main loop. The only reliable path to these bugs is a proper debugger. In this lesson you will set up GDB with OpenOCD over SWD, learn every debugging technique the Cortex-M3 offers, and then hunt down five real bugs planted in a firmware project. #STM32 #Debugging #GDB
+A board works on the bench for ten seconds and then stops, silently, because the code that prints has stopped too. Reading the source again does not help: the line where a program stops is often not the line with the mistake. A debugger lets you stop the processor, look inside its memory and see what happened. In this lesson you connect the GDB debugger to the chip, learn the tools the Cortex-M3 processor gives you, and then find five bugs planted in a firmware project. #STM32 #Debugging #GDB
 
 ## What We Are Building
 
 <Card title="Bug Hunt Challenge: Find and Fix Five Bugs" icon="star">
-A pre-written firmware project with five intentionally planted bugs that cause various failure modes: a HardFault from an unaligned access, a stack overflow from unbounded recursion, a peripheral misconfiguration that silently drops data, a race condition between DMA and main loop code, and a watchdog timeout from a blocking loop. You will use GDB, SWD breakpoints, watchpoints, fault register decoding, and ITM trace to find and fix each one.
+A firmware project with five planted bugs, each of a kind you will meet in real work: a pointer that points at nothing, a function that calls itself without end, a peripheral with a wrong setting, two pieces of code that write the same memory at the same time, and a loop that waits for ever. You find and fix each one with GDB.
 </Card>
 
 **Project specifications:**
@@ -61,12 +61,10 @@ A pre-written firmware project with five intentionally planted bugs that cause v
 
 ### Starting OpenOCD
 
-OpenOCD acts as a bridge between GDB and the ST-Link hardware. It speaks USB to the ST-Link and GDB Remote Serial Protocol to GDB.
+Three parts work together. GDB is the debugger on your computer, where you type commands. The ST-Link is the USB probe, joined to the chip by the two SWD (Serial Wire Debug) wires. OpenOCD sits between them and turns GDB requests into USB messages for the ST-Link.
 
 ```text
-  Debug toolchain:
-
-  +-------+  GDB RSP   +---------+  USB  +--------+
+  +-------+            +---------+  USB  +--------+
   |  GDB  |<---------->| OpenOCD |<----->| ST-Link|
   | (PC)  | port 3333  | (PC)    |       | V2     |
   +-------+            +---------+       +---+----+
@@ -88,6 +86,8 @@ openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
 OpenOCD listens on port 3333 for GDB connections and port 4444 for a telnet command interface.
 
 ### Connecting GDB
+
+Give GDB the `.elf` file, not the `.bin`: it also holds the names of functions and variables and the line numbers, so GDB can show source lines where the chip has only addresses.
 
 ```bash
 # Terminal 2: Start GDB
@@ -138,7 +138,9 @@ continue
 <InArticleAd />
 
 
-The Cortex-M3 has 6 hardware breakpoints and 4 hardware watchpoints built into the silicon. Hardware breakpoints work on flash memory (where your code lives) without modifying the code. Watchpoints trigger when a memory address is read or written, which is invaluable for finding out who is corrupting a variable. GDB can also set software breakpoints by inserting a special instruction (BKPT), but these only work in RAM.
+A breakpoint is a stop sign at a chosen place in the code: use it when you know where to look. A watchpoint is an alarm on a chosen piece of memory, which stops the processor when anything reads or writes it: use it when you know which variable is wrong but not which code changes it.
+
+The Cortex-M3 has 6 hardware breakpoints and 4 hardware watchpoints. They are comparators inside the processor, so they work on code in flash without changing it, and you cannot set more than 6 breakpoints at once.
 
 ### Using Breakpoints
 
@@ -193,41 +195,33 @@ print *((GPIO_TypeDef*)0x40010800)
 <InArticleAd />
 
 
-When the Cortex-M3 encounters an error it cannot handle (invalid memory access, undefined instruction, divide by zero with the trap enabled), it triggers a HardFault exception. The CPU saves its state on the stack so a fault handler can inspect what went wrong.
+Some instructions cannot be carried out: a read from an address with no memory, a code that is not an instruction, a division by zero when that check is on. The Cortex-M3 then jumps to the HardFault handler. The default handler is an empty loop, so without your own the board only seems dead.
+
+Before it jumps, the processor saves eight registers on the stack (the RAM that holds return addresses and local variables). One is the program counter (PC), the address of the instruction that failed. Each takes 4 bytes, so the saved PC, register number 6, is 24 bytes above the stack pointer (SP).
 
 ```text
-  HardFault stack frame (pushed by HW):
-
-  Higher address (older data)
-  +----------------+
-  | xPSR           |  SP + 28
-  +----------------+
-  | PC (return)    |  SP + 24  <-- faulting
-  +----------------+               instruction
-  | LR             |  SP + 20
-  +----------------+
-  | R12            |  SP + 16
-  +----------------+
-  | R3             |  SP + 12
-  +----------------+
-  | R2             |  SP + 8
-  +----------------+
-  | R1             |  SP + 4
-  +----------------+
-  | R0             |  SP + 0
-  +----------------+
-  Lower address (SP after fault)
-
-  In GDB: print/x stack_frame[6]
-  gives the PC of the faulting instruction.
+  higher address
+  +------+
+  | xPSR |  SP + 28   stack_frame[7]
+  | PC   |  SP + 24   stack_frame[6]  <- failed here
+  | LR   |  SP + 20   stack_frame[5]
+  | R12  |  SP + 16   stack_frame[4]
+  | R3   |  SP + 12   stack_frame[3]
+  | R2   |  SP + 8    stack_frame[2]
+  | R1   |  SP + 4    stack_frame[1]
+  | R0   |  SP + 0    stack_frame[0]
+  +------+
+  lower address: SP when the handler starts
 ```
 
-The CPU pushes eight registers onto the stack (R0-R3, R12, LR, PC, xPSR) and jumps to the HardFault handler. By examining these saved registers, you can determine exactly which instruction caused the fault and what the processor state was at that moment.
+LR (the link register) holds the address the failed function would have returned to, so it tells you who called it.
 
 ### HardFault Handler
 
+Four lines of assembly find which stack pointer was in use (MSP for the main program, PSP for tasks under an operating system) and pass it to a C function, which copies the saved registers into variables that GDB can print.
+
 ```c
-void HardFault_Handler(void) {
+__attribute__((naked)) void HardFault_Handler(void) {
     __asm volatile (
         "TST   LR, #4          \n"  /* Check which stack was in use */
         "ITE   EQ               \n"
@@ -255,7 +249,7 @@ void hard_fault_handler_c(uint32_t *stack_frame) {
 
     /* Suppress unused variable warnings */
     (void)r0; (void)r1; (void)r2; (void)r3;
-    (void)r12; (void)lr; (void)psr;
+    (void)r12; (void)lr; (void)pc; (void)psr;
     (void)cfsr; (void)hfsr; (void)mmfar; (void)bfar;
 
     /*
@@ -271,6 +265,8 @@ void hard_fault_handler_c(uint32_t *stack_frame) {
 ```
 
 ### CFSR Bit Decoding
+
+The saved PC says where the program failed. The Configurable Fault Status Register (CFSR) says why. Its 32 bits are three smaller registers side by side, one for each kind of fault. A bit whose name ends in VALID means that the address the program tried to use is stored in MMFAR or BFAR.
 
 | Bit Range | Register | Key Bits |
 |-----------|----------|----------|
@@ -304,42 +300,29 @@ print/x *(uint32_t*)0xE000ED38    # BFAR
 <InArticleAd />
 
 
-ITM (Instrumentation Trace Macrocell) is a hardware debug feature that sends data from the MCU to the debugger through the SWO (Serial Wire Output) pin. It provides printf-style output without consuming a UART.
+Printed messages are still useful, but a UART is slow and your product may need every UART it has. The ITM (Instrumentation Trace Macrocell) in the processor sends bytes to the debug probe through one extra pin, SWO (Serial Wire Output). It uses no UART and changes the program timing very little.
 
 ```text
-  ITM trace output path:
-
-  Firmware            Cortex-M3 debug HW
-  +---------+        +------------------+
-  | ITM     |  write | ITM stimulus     |
-  | PORT[0] |------->| port 0           |
-  | .u8 = c |        +--------+---------+
-  +---------+                  |
-                               v
-                        +------+------+
-                        | TPIU        |
-                        | (Trace Port)|
-                        +------+------+
-                               |
-                            SWO pin (PB3)
-                               |
-                        +------+------+
-                        | ST-Link V2  |
-                        +------+------+
-                               |
-                        +------+------+
-                        | OpenOCD     |
-                        | /tmp/itm.fifo
-                        +-------------+
+  firmware            inside the chip
+  +--------------+    +-----+    +------+
+  | ITM->PORT[0] |--->| ITM |--->| TPIU |
+  +--------------+    +-----+    +--+---+
+                                    | SWO pin (PB3)
+                                    v
+  +---------------+   +---------+   +---------+
+  | /tmp/itm.fifo |<--| OpenOCD |<--| ST-Link |
+  +---------------+   +---------+   +---------+
 ```
 
-Unlike UART printf debugging, ITM does not consume a UART peripheral and has minimal impact on timing. You can send trace messages, variable values, and timestamps through stimulus ports. The Blue Pill's SWO pin is PB3 (shared with JTDO).
+The program writes a byte to an ITM port. The TPIU (Trace Port Interface Unit) sends it out on SWO, which is pin PB3 on the Blue Pill. OpenOCD writes what arrives to a file. Many low-cost ST-Link clones do not connect SWO: if yours has no SWO pin on its connector, ITM gives no output.
 
 ### ITM Printf
 
 ```c
 /* Send a character via ITM stimulus port 0 */
 void itm_putc(char c) {
+    /* Skip if no debugger has enabled ITM and port 0 (avoids a hang) */
+    if (!(ITM->TCR & ITM_TCR_ITMENA_Msk) || !(ITM->TER & 1UL)) return;
     while (ITM->PORT[0].u32 == 0);  /* Wait until port is ready */
     ITM->PORT[0].u8 = (uint8_t)c;
 }
@@ -372,7 +355,7 @@ cat /tmp/itm.fifo
 <InArticleAd />
 
 
-Now apply everything above to find and fix five bugs in the challenge firmware. Here are hints for each bug, followed by solutions.
+Each bug below has a symptom and a way to approach it. The solutions follow.
 
 ### Bug 1: HardFault on Peripheral Enable
 
@@ -395,7 +378,7 @@ Now apply everything above to find and fix five bugs in the challenge firmware. 
 1. Let the firmware run until output stops.
 2. Press Ctrl+C in GDB to halt the CPU.
 3. Run `backtrace` to see where the CPU is stuck.
-4. If the backtrace shows deep recursion or the SP is near the bottom of RAM, you have a stack overflow.
+4. The stack starts at the top of RAM (`0x20005000` on this chip) and grows down. If the backtrace shows the same function hundreds of times, or SP is near the bottom of RAM (`0x20000000`), the stack has grown into your variables. This is a stack overflow.
 5. Check for recursive functions or large local arrays.
 </Steps>
 
@@ -408,7 +391,7 @@ Now apply everything above to find and fix five bugs in the challenge firmware. 
 1. Check if the ADC clock is enabled: `x/xw 0x40021018` (RCC->APB2ENR).
 2. Check if the ADC is powered on: `x/xw 0x40012408` (ADC1->CR2).
 3. Check the DMA buffer: `x/3hx &adc_values`.
-4. Compare the ADC configuration registers against the working code from Lesson 6.
+4. Compare the ADC configuration registers with the working code from the ADC and DMA lesson.
 </Steps>
 
 ### Bug 4: OLED Shows Corrupted Data
@@ -424,7 +407,7 @@ Now apply everything above to find and fix five bugs in the challenge firmware. 
 
 ### Bug 5: System Resets Every ~4 Seconds
 
-**Symptom:** The firmware runs for about 4 seconds, then resets. The reset cause register (RCC->CSR) shows a watchdog reset.
+**Symptom:** The firmware runs for about 4 seconds, then resets. The reset cause register (RCC->CSR) shows a watchdog reset. A watchdog is a timer that resets the chip unless the program restarts it ("feeds" it) in time, so that a program that hangs does not stay hung.
 
 **Debugging approach:**
 <Steps>
@@ -439,7 +422,7 @@ Now apply everything above to find and fix five bugs in the challenge firmware. 
 
 
 :::caution[Try finding the bugs yourself first]
-The solutions below reveal the root cause and fix for each bug. The real learning happens when you use the debugger to find them yourself. Come back to these solutions only after you have spent time investigating each bug.
+The solutions below give the cause and the fix for each bug. You learn most when you find them with the debugger yourself, so read these only after you have tried.
 :::
 
 ### Bug 1 Solution: Null Pointer Dereference
@@ -470,7 +453,7 @@ void log_message(const char *msg) {
     /* ... */
 }
 
-/* Fix: use a loop instead of recursion */
+/* Fix: flush once, then drop the message instead of recursing */
 void log_message(const char *msg) {
     if (log_buf_full()) {
         log_flush();
@@ -494,7 +477,7 @@ RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
 ### Bug 4 Solution: DMA Race Condition
 
-The main loop modifies the framebuffer while SPI DMA is still transmitting the previous frame:
+A race condition is a fault that depends on which of two activities reaches shared data first. Here the main loop changes the framebuffer (the array that holds the picture) while DMA is still sending the previous picture from it:
 
 ```c
 /* Bug: no synchronization */
@@ -560,7 +543,7 @@ while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08)) {
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 8: FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32), you will bring multitasking to the Blue Pill. Sensor reading, display updates, and serial logging will each run as separate FreeRTOS tasks with proper synchronization through queues, semaphores, and mutexes.
+In [Lesson 8: FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32), you split the firmware into separate tasks for the sensor, the display and the log, and let a small operating system run them.
 :::
 
 <EmbeddedProgrammingStm32Comments />
