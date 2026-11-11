@@ -4,7 +4,7 @@ description: "Master STM32 debugging with SWD, GDB breakpoints, watchpoints, Har
 contributors: "sam-macharia,lawrence-langat"
 pubDate: 2026-02-26
 tags: ["stm32", "debugging", "swd", "gdb", "fault-handler", "hardfault", "itm"]
-excerpt: "Take on a bug hunt challenge: five subtle bugs are hidden in pre-written STM32 firmware. Use GDB with SWD to set breakpoints, inspect registers, decode HardFault exceptions, trace execution with ITM, and watch memory changes in real time. These are the debugging skills that separate frustrating hours from quick fixes."
+excerpt: "Take on a bug hunt challenge: plant five typical bugs in your own STM32 firmware and find them. Use GDB with SWD to set breakpoints, inspect registers, decode HardFault exceptions, trace execution with ITM, and watch memory changes in real time. These are the debugging skills that separate frustrating hours from quick fixes."
 heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/debugging-swd-gdb-fault-handlers.png"
 ---
 
@@ -295,6 +295,19 @@ print/x *(uint32_t*)0xE000ED34    # MMFAR
 print/x *(uint32_t*)0xE000ED38    # BFAR
 ```
 
+### Check it
+
+Prove the handler works before you need it: add this fault to `main()` and break on `hard_fault_handler_c`.
+
+```c
+/* A function pointer that points at nothing. volatile: the compiler
+ * must really load it and make the call. */
+void (* volatile no_function)(void) = 0;
+no_function();                   /* jump to address 0 */
+```
+
+Expect `pc = 0x0`, `cfsr = 0x20000` (INVSTATE: an address with bit 0 clear, which a Cortex-M3 cannot run) and `hfsr = 0x40000000` (FORCED). With PC at 0, `info line *lr` names the line after the call. If the breakpoint is never reached, check that the handler is named exactly `HardFault_Handler`.
+
 ## ITM Trace Output
 
 <InArticleAd />
@@ -345,7 +358,10 @@ tpiu config internal /tmp/itm.fifo uart off 72000000 2000000
 itm port 0 on
 ```
 
+That `tpiu config` line is the form of OpenOCD 0.10 and 0.11. From 0.12 the same settings are `stm32f1x.tpiu configure -protocol uart -traceclk 72000000 -pin-freq 2000000 -output /tmp/itm.fifo` followed by `stm32f1x.tpiu enable`.
+
 ```bash
+# Before starting OpenOCD, create the pipe: mkfifo /tmp/itm.fifo
 # In a separate terminal, read the ITM output:
 cat /tmp/itm.fifo
 ```
@@ -355,7 +371,7 @@ cat /tmp/itm.fifo
 <InArticleAd />
 
 
-Each bug below has a symptom and a way to approach it. The solutions follow.
+Each bug below has a symptom and a way to approach it. The solutions follow. The planted project is not listed here: put each bug from the solutions into your sensor hub program from the SPI and I2C lesson, one at a time (or ask a colleague to), and hunt it with the debugger.
 
 ### Bug 1: HardFault on Peripheral Enable
 
@@ -365,8 +381,8 @@ Each bug below has a symptom and a way to approach it. The solutions follow.
 <Steps>
 1. Set a breakpoint at `sensor_init()` and step through line by line.
 2. When the HardFault triggers, examine the saved PC register in the fault handler.
-3. Look up the source line with `info line *<PC>`.
-4. Check: is the code dereferencing a pointer? Is that pointer valid?
+3. Look up the source line with `info line *<PC>`. If the saved PC is 0, the program jumped through an empty function pointer: look up the saved LR instead.
+4. Check: is the code using a pointer? Is that pointer valid?
 </Steps>
 
 ### Bug 2: Serial Output Stops After 10 Seconds
@@ -380,6 +396,7 @@ Each bug below has a symptom and a way to approach it. The solutions follow.
 3. Run `backtrace` to see where the CPU is stuck.
 4. The stack starts at the top of RAM (`0x20005000` on this chip) and grows down. If the backtrace shows the same function hundreds of times, or SP is near the bottom of RAM (`0x20000000`), the stack has grown into your variables. This is a stack overflow.
 5. Check for recursive functions or large local arrays.
+6. If `pc` is `0xfffffffe` (a lockup), the stack left RAM and even the fault handler could not run. `watch` a known value at the bottom of the stack area and run again.
 </Steps>
 
 ### Bug 3: ADC Readings Always Zero
@@ -427,17 +444,26 @@ The solutions below give the cause and the fix for each bug. You learn most when
 
 ### Bug 1 Solution: Null Pointer Dereference
 
-The `sensor_init()` function receives a pointer to a configuration struct, but the caller passes `NULL`:
+The `sensor_init()` function receives a configuration struct that holds a pointer to the function that reads the sensor, but the caller never filled it in, so it is `NULL`:
 
 ```c
-/* Bug: passing NULL */
-sensor_config_t *config = NULL;
-sensor_init(config);  /* Dereferences config->i2c_addr, causing HardFault */
+typedef struct {
+    uint8_t i2c_addr;
+    uint8_t oversample;
+    int (*read_reg)(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len);
+} sensor_config_t;
 
-/* Fix: initialize the struct */
+/* Bug: .read_reg is left out, so it is NULL */
 sensor_config_t config = { .i2c_addr = 0x76, .oversample = 1 };
+sensor_init(&config);  /* Calls config->read_reg(): a jump to 0, HardFault */
+
+/* Fix: fill in every member the driver uses */
+sensor_config_t config = { .i2c_addr = 0x76, .oversample = 1,
+                           .read_reg = i2c1_read_burst };
 sensor_init(&config);
 ```
+
+A NULL data pointer is quieter on this chip: address 0 shows the start of flash, so a read through NULL returns vector table numbers with no fault. Check pointers before use; do not count on a crash.
 
 ### Bug 2 Solution: Unbounded Recursion
 
@@ -495,11 +521,12 @@ oled_update_dma();
 
 ### Bug 5 Solution: Blocking Loop Starves Watchdog
 
-A sensor read function has a blocking wait for a "data ready" flag that never gets set because the sensor was not properly configured:
+A sensor read function waits for a status bit that never gets set, because the sensor was left in sleep mode and never measures:
 
 ```c
-/* Bug: infinite wait if sensor not configured */
-while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08));  /* Wait for data ready */
+/* Bug: infinite wait if sensor not configured.
+ * Bit 3 of status register 0xF3 is "measuring": 1 while a conversion runs. */
+while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08));  /* Wait for a conversion */
 
 /* Fix: add timeout */
 uint32_t start = systick_ms;
@@ -507,16 +534,17 @@ while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08)) {
     if ((systick_ms - start) > 100) {
         return SENSOR_TIMEOUT;  /* Bail out after 100 ms */
     }
-    iwdg_feed();  /* Keep watchdog alive while waiting */
 }
 ```
+
+Do not feed the watchdog inside such a wait: a loop that feeds it can hang for ever with no reset. Feed it once per pass of the main loop; a 100 ms limit fits easily inside 4 seconds.
 
 ## What You Have Learned
 
 <InArticleAd />
 
 
-<Card title="Lesson 7 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
 **GDB skills:**
 - Connecting GDB to OpenOCD for live debugging over SWD
@@ -543,7 +571,7 @@ while (!(i2c_read_reg(BME280_ADDR, 0xF3) & 0x08)) {
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 8: FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32), you split the firmware into separate tasks for the sensor, the display and the log, and let a small operating system run them.
+In [FreeRTOS Fundamentals on STM32](/education/embedded-programming-stm32/freertos-fundamentals-stm32/), you split the firmware into separate tasks for the sensor, the display and the log, and let a small operating system run them.
 :::
 
 <EmbeddedProgrammingStm32Comments />

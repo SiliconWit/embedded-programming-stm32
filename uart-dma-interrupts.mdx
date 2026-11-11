@@ -54,7 +54,7 @@ A command line on the Blue Pill that runs commands typed over UART. DMA puts rec
 | `help` | `help` | List all available commands |
 | `pwm <ch> <duty>` | `pwm 1 75` | Set TIM2 channel 1 to 75% duty |
 | `read <port><pin>` | `read A5` | Read the digital state of PA5 |
-| `dump <periph>` | `dump RCC` | Print all registers of a peripheral |
+| `dump <periph>` | `dump RCC` | Print the main registers of a peripheral (RCC here; add others the same way) |
 | `reset` | `reset` | Software reset the MCU |
 
 ## NVIC and Interrupt Priorities
@@ -209,6 +209,8 @@ void uart_dma_rx_init(void) {
 
 The DMA controller writes into the buffer; the program reads from it. CNDTR counts down from 256, so the write position is 256 minus CNDTR. `rx_read_pos` is where the program has read up to, and the bytes between the two positions are waiting.
 
+Terminal programs such as PuTTY and minicom send each key as it is pressed, so `uart_dma_read_line()` keeps a part line between calls and returns a length only when Enter (`\r` or `\n`) completes it.
+
 ```c
 uint16_t uart_dma_available(void) {
     uint16_t write_pos = RX_BUF_SIZE - DMA1_Channel5->CNDTR;
@@ -225,24 +227,29 @@ uint8_t uart_dma_read_byte(void) {
     return byte;
 }
 
+/* Returns the length of a complete line, or 0 while the line is still
+ * arriving. Call it with the same dest each time: the part received so
+ * far stays there. Characters past max_len - 1 are dropped. */
 uint16_t uart_dma_read_line(char *dest, uint16_t max_len) {
-    uint16_t count = 0;
-    while (uart_dma_available() > 0 && count < max_len - 1) {
+    static uint16_t count = 0;
+    while (uart_dma_available() > 0) {
         char c = (char)uart_dma_read_byte();
         if (c == '\n' || c == '\r') {
-            if (count > 0) break;  /* End of line */
-            continue;              /* Skip leading newlines */
+            if (count == 0) continue;  /* Skip empty lines */
+            dest[count] = '\0';        /* End of line */
+            uint16_t len = count;
+            count = 0;
+            return len;
         }
-        dest[count++] = c;
+        if (count < max_len - 1) dest[count++] = c;
     }
-    dest[count] = '\0';
-    return count;
+    return 0;
 }
 ```
 
 ### Idle Line Detection
 
-The DMA controller does not know when a command is complete; the UART does. Its idle line interrupt fires when the RX line stays quiet for one byte time (87 microseconds here) after data. A terminal sends a command as a group of characters and then nothing, so the silence marks the end.
+The DMA controller does not know when data has stopped coming; the UART does. Its idle line interrupt fires when the RX line stays quiet for one byte time (87 microseconds here) after data. So the program wakes once per group of characters, a whole pasted command or one typed key.
 
 ```text
   RX line:  ____  __ __ __ __ __  ____________
@@ -253,7 +260,7 @@ The DMA controller does not know when a command is complete; the UART does. Its 
                           IDLE interrupt fires here
 ```
 
-At that moment the buffer holds the whole command, between the read position and the write position:
+When the command came as one group, the buffer now holds all of it, between the read position and the write position:
 
 ```text
   +---+---+---+---+---+---+---+---+
@@ -372,7 +379,7 @@ void cmd_help(void) {
         "  help              Show this help\r\n"
         "  pwm <ch> <duty>   Set TIM2 channel PWM (0-100%)\r\n"
         "  read <port><pin>  Read GPIO pin (e.g., read A5)\r\n"
-        "  dump <periph>     Dump registers (RCC, GPIOA, TIM2)\r\n"
+        "  dump RCC          Dump the RCC registers\r\n"
         "  reset             Software reset\r\n\r\n";
     uart_dma_send(msg, strlen(msg));
 }
@@ -410,11 +417,12 @@ void cmd_read_pin(const char *args) {
     int32_t pin;
     parse_int(args, &pin);
 
+    /* Switch the port clock on too: a port without a clock reads 0 */
     GPIO_TypeDef *port = NULL;
     switch (port_letter) {
-        case 'A': case 'a': port = GPIOA; break;
-        case 'B': case 'b': port = GPIOB; break;
-        case 'C': case 'c': port = GPIOC; break;
+        case 'A': case 'a': port = GPIOA; RCC->APB2ENR |= RCC_APB2ENR_IOPAEN; break;
+        case 'B': case 'b': port = GPIOB; RCC->APB2ENR |= RCC_APB2ENR_IOPBEN; break;
+        case 'C': case 'c': port = GPIOC; RCC->APB2ENR |= RCC_APB2ENR_IOPCEN; break;
     }
 
     if (!port || pin < 0 || pin > 15) {
@@ -532,6 +540,13 @@ Connect PA9 to your serial adapter's RX and PA10 to its TX (cross-connect). Open
 > dump RCC
 > reset
 ```
+
+### Check it
+
+- `pwm 1 100` then `read A0` gives `PA0 = 1`; `pwm 1 0` then `read A0` gives 0. The pin is read back, so the command reached the timer. (Only channel 1 has its pin set up; `pwm 2` to `4` change no pin.)
+- `pwm 1 50`: a multimeter on PA0 reads about 1.65 V. Disconnect the servo first: a 10 ms pulse is far outside its range.
+- `dump RCC` shows `CFGR = 0x001D040A` (PLL from HSE, times 9, APB1 divided by 2, PLL selected) and `AHBENR = 0x00000015` (DMA clock on).
+- Paste ten `read A0` lines at once: ten answers, or bytes were lost.
 
 ## What You Have Learned
 

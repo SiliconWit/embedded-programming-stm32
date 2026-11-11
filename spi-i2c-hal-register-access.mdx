@@ -30,7 +30,7 @@ A sensor or a display is a separate chip that the microcontroller talks to over 
 ## What We Are Building
 
 <Card title="Sensor Dashboard on OLED Display" icon="star">
-A real-time dashboard of temperature, humidity and pressure from a BME280 sensor (on I2C) on a 128x64 SSD1306 OLED display (on SPI, for fast screen updates). Both drivers exist in HAL and register-level versions, chosen at compile time, so you can compare them.
+A real-time dashboard of temperature, humidity and pressure from a BME280 sensor (on I2C) on a 128x64 SSD1306 OLED display (on SPI, for fast screen updates). You write each driver twice, with HAL and with registers, and compare them.
 </Card>
 
 **Project specifications:**
@@ -43,7 +43,7 @@ A real-time dashboard of temperature, humidity and pressure from a BME280 sensor
 | SPI peripheral | SPI1 (SCK: PA5, MOSI: PA7, CS: PA4, DC: PA3, RST: PA2) |
 | I2C peripheral | I2C1 (SCL: PB6, SDA: PB7) |
 | I2C address | 0x76 (BME280 with SDO tied to GND) |
-| SPI clock | 18 MHz (APB2 / 4) |
+| SPI clock | 9 MHz (APB2 / 8; the SSD1306 allows 10 MHz at most) |
 | I2C speed | Fast mode (400 kHz maximum, 360 kHz with a 36 MHz APB1 clock) |
 | Update rate | 2 Hz (read sensor, update display) |
 
@@ -85,7 +85,7 @@ SPI (Serial Peripheral Interface) is the simple, fast bus. The microcontroller, 
   CS pin: LOW = selected (active)
 ```
 
-The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus and SPI2 on APB1. We run SPI1 at 18 MHz ($72\ \text{MHz} / 4$), which is fast enough for an OLED display.
+The STM32F103 has two SPI peripherals: SPI1 on the APB2 bus and SPI2 on APB1. We run SPI1 at 9 MHz ($72\ \text{MHz} / 8$): the SSD1306 allows 10 MHz at most (a 100 ns clock cycle), so the next setting, 18 MHz, is outside its specification even when it works on the bench.
 
 ### SPI Configuration Registers
 
@@ -122,7 +122,7 @@ void spi1_init(void) {
     SPI1->CR1 = SPI_CR1_MSTR       /* Master mode */
               | SPI_CR1_SSM        /* Software CS management */
               | SPI_CR1_SSI        /* Internal CS high */
-              | (0x1 << 3);       /* Baud rate: fPCLK/4 = 18 MHz */
+              | (0x2 << 3);       /* Baud rate: fPCLK/8 = 9 MHz */
     /* CPOL=0, CPHA=0 (SSD1306 default), 8-bit data */
 
     SPI1->CR1 |= SPI_CR1_SPE;     /* Enable SPI */
@@ -158,7 +158,7 @@ void HAL_SPI1_Init(void) {
     hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
     hspi1.Init.NSS = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
     hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
     HAL_SPI_Init(&hspi1);
 }
@@ -258,9 +258,26 @@ void oled_pixel(uint8_t x, uint8_t y, uint8_t on) {
     }
 }
 
-/* 5x7 font character rendering (font table omitted for brevity) */
-void oled_char(uint8_t x, uint8_t y, char c);
-void oled_string(uint8_t x, uint8_t y, const char *str);
+/* 5x7 font: 5 column bytes for each character from ' ' (0x20) to '~'.
+ * Take the table from any open SSD1306 or GFX library (about 475 bytes). */
+extern const uint8_t font5x7[95][5];
+
+void oled_char(uint8_t x, uint8_t y, char c) {
+    if (c < ' ' || c > '~') c = '?';
+    for (uint8_t col = 0; col < 5; col++) {
+        uint8_t bits = font5x7[c - ' '][col];
+        for (uint8_t row = 0; row < 7; row++) {
+            oled_pixel(x + col, y + row, (bits >> row) & 1);
+        }
+    }
+}
+
+void oled_string(uint8_t x, uint8_t y, const char *str) {
+    while (*str && x <= 122) {
+        oled_char(x, y, *str++);
+        x += 6;                          /* 5 columns and a space */
+    }
+}
 ```
 
 ## I2C on the STM32F103
@@ -303,7 +320,7 @@ Reading one register of the sensor takes five steps on the bus:
 4. A second START and the address again, now with the read bit (0xED).
 5. The sensor sends the data byte. The master answers NACK (no acknowledge: "that was the last byte") and sends STOP.
 
-Each `while` line waits for the flag of one step. If the chip does not answer, the flag never comes and this simple code waits for ever; a driver for real use needs a timeout.
+Each step waits for a flag. If the chip does not answer (a loose wire, no sensor), the flag never comes: the plain `i2c1_read_reg()` would wait for ever. The two functions the sensor driver uses wait at most 10 ms a step, then send STOP and return 0, so the program can report the fault.
 
 ```c
 void i2c1_init(void) {
@@ -365,23 +382,43 @@ uint8_t i2c1_read_reg(uint8_t addr, uint8_t reg) {
     return data;
 }
 
-void i2c1_read_burst(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
+extern volatile uint32_t systick_ms;
+
+/* Wait for a flag in SR1, at most 10 ms. Returns 0 on timeout:
+ * no chip answered, or the bus is stuck (the BUSY fault). */
+int i2c1_wait(uint32_t flag) {
+    uint32_t start = systick_ms;
+    while (!(I2C1->SR1 & flag)) {
+        if (systick_ms - start > 10) return 0;
+    }
+    return 1;
+}
+
+/* After a failure: send STOP to free the bus and clear the NACK flag */
+int i2c1_fail(void) {
+    I2C1->CR1 |= I2C_CR1_STOP;
+    I2C1->SR1 = ~I2C_SR1_AF;          /* AF clears when 0 is written */
+    return 0;
+}
+
+/* Returns 1 when all len bytes arrived, 0 on failure */
+int i2c1_read_burst(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
     I2C1->CR1 |= I2C_CR1_START;
-    while (!(I2C1->SR1 & I2C_SR1_SB));
+    if (!i2c1_wait(I2C_SR1_SB)) return i2c1_fail();
 
     I2C1->DR = (addr << 1) | 0;
-    while (!(I2C1->SR1 & I2C_SR1_ADDR));
+    if (!i2c1_wait(I2C_SR1_ADDR)) return i2c1_fail();
     (void)I2C1->SR2;
 
     I2C1->DR = reg;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
 
     I2C1->CR1 |= I2C_CR1_START;
-    while (!(I2C1->SR1 & I2C_SR1_SB));
+    if (!i2c1_wait(I2C_SR1_SB)) return i2c1_fail();
 
     I2C1->DR = (addr << 1) | 1;
     I2C1->CR1 |= I2C_CR1_ACK;
-    while (!(I2C1->SR1 & I2C_SR1_ADDR));
+    if (!i2c1_wait(I2C_SR1_ADDR)) return i2c1_fail();
     (void)I2C1->SR2;
 
     for (uint8_t i = 0; i < len; i++) {
@@ -389,30 +426,31 @@ void i2c1_read_burst(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
             I2C1->CR1 &= ~I2C_CR1_ACK;  /* NACK last byte */
             I2C1->CR1 |= I2C_CR1_STOP;
         }
-        while (!(I2C1->SR1 & I2C_SR1_RXNE));
+        if (!i2c1_wait(I2C_SR1_RXNE)) return i2c1_fail();
         buf[i] = (uint8_t)I2C1->DR;
     }
+    return 1;
 }
 
-void i2c1_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
+int i2c1_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 {
-    while (I2C1->SR2 & I2C_SR2_BUSY);
-    I2C1->CR1 |= I2C_CR1_START;
-    while (!(I2C1->SR1 & I2C_SR1_SB));
+    I2C1->CR1 |= I2C_CR1_START;       /* waits by itself while BUSY */
+    if (!i2c1_wait(I2C_SR1_SB)) return i2c1_fail();
     I2C1->DR = addr << 1;
-    while (!(I2C1->SR1 & I2C_SR1_ADDR));
+    if (!i2c1_wait(I2C_SR1_ADDR)) return i2c1_fail();
     (void)I2C1->SR2;
     I2C1->DR = reg;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
     I2C1->DR = val;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
     I2C1->CR1 |= I2C_CR1_STOP;
+    return 1;
 }
 ```
 
 ### HAL I2C Driver (Comparison)
 
-HAL does all five steps in one call, and the call has a timeout.
+HAL does all five steps in one call with a timeout in milliseconds (`HAL_MAX_DELAY` means for ever).
 
 ```c
 I2C_HandleTypeDef hi2c1;
@@ -425,10 +463,12 @@ void HAL_I2C1_Init(void) {
     HAL_I2C_Init(&hi2c1);
 }
 
-/* Reading a register with HAL: one line */
+/* Reading a register with HAL: one call, at most 10 ms */
 uint8_t data;
-HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1, reg, I2C_MEMADD_SIZE_8BIT,
-                 &data, 1, HAL_MAX_DELAY);
+if (HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1, reg, I2C_MEMADD_SIZE_8BIT,
+                     &data, 1, 10) != HAL_OK) {
+    /* No answer: report it, and do not use data */
+}
 ```
 
 ## BME280 Sensor Driver
@@ -438,7 +478,7 @@ HAL_I2C_Mem_Read(&hi2c1, 0x76 << 1, reg, I2C_MEMADD_SIZE_8BIT,
 
 ### Reading Calibration and Sensor Data
 
-The raw sensor numbers are not degrees. Each BME280 holds its own factory correction numbers (calibration data), which the driver reads once and uses in the datasheet formula. The code below converts only the temperature; pressure and humidity are fixed placeholder values until you add their formulas from the Bosch reference code.
+The raw sensor numbers are not degrees. Each BME280 holds its own factory correction numbers (calibration data), which the driver reads once and uses in the datasheet formulas. Temperature comes first: it sets `t_fine`, which corrects pressure and humidity. With Bosch's worked example these formulas give 25.08 C and 100,653 Pa. When the sensor does not answer, the functions return 0 and the program shows no numbers rather than old ones.
 
 ```c
 #define BME280_ADDR 0x76
@@ -457,51 +497,97 @@ typedef struct {
 
 static bme280_calib_t cal;
 
-void bme280_init(void) {
-    /* Soft reset */
-    i2c1_write_reg(BME280_ADDR, 0xE0, 0xB6);
+#define U16(b, i) ((uint16_t)((b)[(i) + 1] << 8 | (b)[i]))
+
+/* Returns 1 when the sensor answered, 0 when it did not */
+int bme280_init(void) {
+    uint8_t buf[26], h[7];
+
+    /* Soft reset, then wait about 50 ms (the sensor needs 2 ms) */
+    if (!i2c1_write_reg(BME280_ADDR, 0xE0, 0xB6)) return 0;
     for (volatile int i = 0; i < 500000; i++);
 
-    /* Read calibration data */
-    uint8_t buf[26];
-    i2c1_read_burst(BME280_ADDR, 0x88, buf, 26);
+    /* Calibration: 0x88 to 0xA1, and 0xE1 to 0xE7 */
+    if (!i2c1_read_burst(BME280_ADDR, 0x88, buf, 26)) return 0;
+    if (!i2c1_read_burst(BME280_ADDR, 0xE1, h, 7)) return 0;
 
-    cal.dig_T1 = (uint16_t)(buf[1] << 8 | buf[0]);
-    cal.dig_T2 = (int16_t)(buf[3] << 8 | buf[2]);
-    cal.dig_T3 = (int16_t)(buf[5] << 8 | buf[4]);
-    cal.dig_P1 = (uint16_t)(buf[7] << 8 | buf[6]);
-    cal.dig_P2 = (int16_t)(buf[9] << 8 | buf[8]);
-    /* ... remaining calibration values ... */
+    cal.dig_T1 = U16(buf, 0);
+    cal.dig_T2 = (int16_t)U16(buf, 2);
+    cal.dig_T3 = (int16_t)U16(buf, 4);
+    cal.dig_P1 = U16(buf, 6);
+    cal.dig_P2 = (int16_t)U16(buf, 8);
+    cal.dig_P3 = (int16_t)U16(buf, 10);
+    cal.dig_P4 = (int16_t)U16(buf, 12);
+    cal.dig_P5 = (int16_t)U16(buf, 14);
+    cal.dig_P6 = (int16_t)U16(buf, 16);
+    cal.dig_P7 = (int16_t)U16(buf, 18);
+    cal.dig_P8 = (int16_t)U16(buf, 20);
+    cal.dig_P9 = (int16_t)U16(buf, 22);
+    cal.dig_H1 = buf[25];
+    cal.dig_H2 = (int16_t)U16(h, 0);
+    cal.dig_H3 = h[2];
+    cal.dig_H4 = (int16_t)(((int8_t)h[3] * 16) | (h[4] & 0x0F));
+    cal.dig_H5 = (int16_t)(((int8_t)h[5] * 16) | (h[4] >> 4));
+    cal.dig_H6 = (int8_t)h[6];
 
     /* Configure: humidity x1, temp x1, pressure x1, normal mode */
-    i2c1_write_reg(BME280_ADDR, 0xF2, 0x01);  /* ctrl_hum */
-    i2c1_write_reg(BME280_ADDR, 0xF4, 0x27);  /* ctrl_meas */
-    i2c1_write_reg(BME280_ADDR, 0xF5, 0xA0);  /* config: standby 1s */
+    if (!i2c1_write_reg(BME280_ADDR, 0xF2, 0x01)) return 0;  /* ctrl_hum */
+    if (!i2c1_write_reg(BME280_ADDR, 0xF4, 0x27)) return 0;  /* ctrl_meas */
+    if (!i2c1_write_reg(BME280_ADDR, 0xF5, 0x80)) return 0;  /* config: standby 500 ms */
+    return 1;
 }
 
-void bme280_read(int32_t *temp_c100, uint32_t *press_pa, uint32_t *hum_q10) {
-    uint8_t raw[8];
-    i2c1_read_burst(BME280_ADDR, 0xF7, raw, 8);
-
-    int32_t adc_P = (int32_t)((raw[0] << 12) | (raw[1] << 4) | (raw[2] >> 4));
-    int32_t adc_T = (int32_t)((raw[3] << 12) | (raw[4] << 4) | (raw[5] >> 4));
-    int32_t adc_H = (int32_t)((raw[6] << 8) | raw[7]);
-
-    /* Temperature compensation (from BME280 datasheet) */
+/* Compensation formulas from the BME280 datasheet (integer versions) */
+static int32_t bme280_temp(int32_t adc_T) {
     int32_t var1 = ((((adc_T >> 3) - ((int32_t)cal.dig_T1 << 1)))
                     * ((int32_t)cal.dig_T2)) >> 11;
     int32_t var2 = (((((adc_T >> 4) - ((int32_t)cal.dig_T1))
                     * ((adc_T >> 4) - ((int32_t)cal.dig_T1))) >> 12)
                     * ((int32_t)cal.dig_T3)) >> 14;
     cal.t_fine = var1 + var2;
-    *temp_c100 = (cal.t_fine * 5 + 128) >> 8;  /* Celsius x 100 */
+    return (cal.t_fine * 5 + 128) >> 8;              /* Celsius x 100 */
+}
 
-    /* Pressure and humidity compensation follow similar formulas */
-    /* (full implementation from Bosch reference code) */
-    (void)adc_P;
-    (void)adc_H;
-    *press_pa = 101325;   /* Placeholder */
-    *hum_q10 = 500;       /* Placeholder */
+static uint32_t bme280_press(int32_t adc_P) {        /* needs t_fine */
+    int64_t var1 = (int64_t)cal.t_fine - 128000;
+    int64_t var2 = var1 * var1 * cal.dig_P6;
+    var2 += (var1 * cal.dig_P5) * 131072;
+    var2 += (int64_t)cal.dig_P4 * 34359738368;
+    var1 = ((var1 * var1 * cal.dig_P3) >> 8) + ((var1 * cal.dig_P2) * 4096);
+    var1 = ((((int64_t)1 << 47) + var1) * cal.dig_P1) >> 33;
+    if (var1 == 0) return 0;                         /* avoid dividing by 0 */
+    int64_t p = 1048576 - adc_P;
+    p = (((p * 2147483648) - var2) * 3125) / var1;
+    var1 = ((int64_t)cal.dig_P9 * (p >> 13) * (p >> 13)) >> 25;
+    var2 = ((int64_t)cal.dig_P8 * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + ((int64_t)cal.dig_P7 << 4);
+    return (uint32_t)(p >> 8);                       /* pascals */
+}
+
+static uint32_t bme280_hum(int32_t adc_H) {          /* needs t_fine */
+    int32_t v = cal.t_fine - 76800;
+    v = (((((adc_H << 14) - ((int32_t)cal.dig_H4 << 20) - ((int32_t)cal.dig_H5 * v))
+          + 16384) >> 15) * (((((((v * cal.dig_H6) >> 10) * (((v * (int32_t)cal.dig_H3) >> 11)
+          + 32768)) >> 10) + 2097152) * cal.dig_H2 + 8192) >> 14));
+    v -= (((((v >> 15) * (v >> 15)) >> 7) * (int32_t)cal.dig_H1) >> 4);
+    if (v < 0) v = 0;
+    if (v > 419430400) v = 419430400;
+    return ((uint32_t)(v >> 12) * 10) >> 10;         /* percent x 10 */
+}
+
+/* Returns 1 with fresh values, 0 when the sensor did not answer */
+int bme280_read(int32_t *temp_c100, uint32_t *press_pa, uint32_t *hum_q10) {
+    uint8_t raw[8];
+    if (!i2c1_read_burst(BME280_ADDR, 0xF7, raw, 8)) return 0;
+
+    int32_t adc_P = (int32_t)((raw[0] << 12) | (raw[1] << 4) | (raw[2] >> 4));
+    int32_t adc_T = (int32_t)((raw[3] << 12) | (raw[4] << 4) | (raw[5] >> 4));
+    int32_t adc_H = (int32_t)((raw[6] << 8) | raw[7]);
+
+    *temp_c100 = bme280_temp(adc_T);                 /* first: sets t_fine */
+    *press_pa  = bme280_press(adc_P);
+    *hum_q10   = bme280_hum(adc_H);
+    return 1;
 }
 ```
 
@@ -515,7 +601,7 @@ The project uses both buses, each with its own chip. SPI1 and I2C1 are separate 
 ```text
        STM32F103
   +-----------------+
-  | SPI1, 18 MHz    |  SCK, MOSI, CS, DC
+  | SPI1, 9 MHz     |  SCK, MOSI, CS, DC
   | PA5 PA7 PA4 PA3 +-------------------> SSD1306 OLED
   |                 |
   | I2C1, 360 kHz   |  SCL, SDA
@@ -523,19 +609,19 @@ The project uses both buses, each with its own chip. SPI1 and I2C1 are separate 
   +-----------------+
 ```
 
-With both versions built on a Blue Pill, the two compare like this:
+Both versions of this project were compiled (arm-none-eabi-gcc, `-Os`, newlib-nano, with `snprintf` and the font table in both), and the two compare like this:
 
 | Metric | Register Level | HAL |
 |--------|---------------|-----|
-| Flash usage (full project) | ~4.2 KB | ~12.8 KB |
-| RAM usage | ~1.2 KB | ~1.8 KB |
-| SPI byte transfer time | ~0.5 us | ~1.2 us |
+| Flash usage (full project) | ~8.1 KB | ~13.1 KB |
+| RAM usage (without stack and heap) | ~1.2 KB | ~1.4 KB |
+| SPI, one full screen (1,024 bytes) | at least 0.91 ms | at least 0.91 ms, plus HAL's own time per call |
 | I2C single register read | ~110 us | ~110 us, set by the bus |
 | I2C burst read (8 bytes) | ~280 us | ~280 us, set by the bus |
 | Lines of driver code | ~180 | ~40 |
 | Debug difficulty | Higher (must know registers) | Lower (descriptive API) |
 
-The two I2C rows are calculated, not measured. At 360 kHz one bit takes 2.8 microseconds, and a byte with its acknowledge is 9 bits. A single register read moves 4 bytes, so it takes at least 36 x 2.8 = 100 microseconds. On a slow bus the bus sets the time, not the driver.
+HAL costs about 5 KB of flash here, 8 percent of this chip. The time rows are calculated: a screen is 8,192 bits, 0.91 ms at 9 MHz. At 360 kHz one I2C bit takes 2.8 microseconds, and a byte with its acknowledge is 9 bits. A single register read moves 4 bytes, so it takes at least 36 x 2.8 = 100 microseconds. On a slow bus the bus sets the time, not the driver.
 
 ### When to Use Which
 
@@ -561,46 +647,55 @@ Many professional projects mix the two.
 ```c
 #include <stdio.h>
 
+/* Show one line on the display and send it to the serial terminal */
+static void show(uint8_t y, const char *s) {
+    oled_string(0, y, s);
+    uart_send_string(s);
+    uart_send_string("\r\n");
+}
+
 int main(void) {
     clock_init();
     systick_init();
     spi1_init();
     i2c1_init();
     oled_init();
-    bme280_init();
     uart_init();
+    int sensor_ok = bme280_init();
 
     char line[32];
     int32_t temp;
     uint32_t press, hum;
 
     while (1) {
-        bme280_read(&temp, &press, &hum);
-
         oled_clear();
 
         /* Title */
-        oled_string(0, 0, "STM32 Sensor Hub");
+        show(0, "STM32 Sensor Hub");
 
-        /* Temperature */
-        snprintf(line, sizeof(line), "Temp: %ld.%02ld C",
-                 (long)(temp / 100), (long)(temp % 100));
-        oled_string(0, 16, line);
+        if (!sensor_ok) sensor_ok = bme280_init();   /* try again */
 
-        /* Pressure */
-        snprintf(line, sizeof(line), "Press: %lu Pa", (unsigned long)press);
-        oled_string(0, 32, line);
+        if (sensor_ok && bme280_read(&temp, &press, &hum)) {
+            /* Temperature: sign apart, so -0.50 C does not print as 0.-50 */
+            long t = temp < 0 ? -(long)temp : (long)temp;
+            snprintf(line, sizeof(line), "Temp: %s%ld.%02ld C",
+                     temp < 0 ? "-" : "", t / 100, t % 100);
+            show(16, line);
 
-        /* Humidity */
-        snprintf(line, sizeof(line), "Hum: %lu.%lu %%",
-                 (unsigned long)(hum / 10), (unsigned long)(hum % 10));
-        oled_string(0, 48, line);
+            /* Pressure */
+            snprintf(line, sizeof(line), "Press: %lu Pa", (unsigned long)press);
+            show(32, line);
+
+            /* Humidity */
+            snprintf(line, sizeof(line), "Hum: %lu.%lu %%",
+                     (unsigned long)(hum / 10), (unsigned long)(hum % 10));
+            show(48, line);
+        } else {
+            sensor_ok = 0;                   /* no numbers: none are known */
+            show(16, "Sensor: no answer");
+        }
 
         oled_update();
-
-        /* Also print to serial */
-        uart_send_string(line);
-        uart_send_string("\r\n");
 
         /* 500 ms delay */
         uint32_t start = systick_ms;
@@ -609,7 +704,12 @@ int main(void) {
 }
 ```
 
-## What You Have Learned
+### Check it
+
+- Temperature: within about 1 C of a thermometer beside it (1 to 2 degrees high is often heat from the board).
+- Pressure: about 12 Pa lower for each metre above sea level, so about 89,900 Pa at 1,000 m, not the 101,325 of a weather report.
+- Humidity: breathe on the sensor; the value rises within seconds and falls back.
+- Pull the SDA wire: `Sensor: no answer` within a second, and readings again when it is back.
 
 <InArticleAd />
 

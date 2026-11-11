@@ -4,7 +4,7 @@ description: "Build a voltage and current monitor with threshold alerts using th
 contributors: "sam-macharia,lawrence-langat"
 pubDate: 2026-02-19
 tags: ["stm32", "adc", "dma", "analog-watchdog", "current-sensor", "ina219"]
-excerpt: "Build a voltage and current monitoring system that scans multiple ADC channels via DMA, uses hardware oversampling for noise reduction, and triggers analog watchdog alerts when readings exceed safe thresholds. Interface with an INA219 current sensor for precision current measurement."
+excerpt: "Build a voltage and current monitoring system that scans multiple ADC channels via DMA, uses software oversampling for noise reduction, and triggers analog watchdog alerts when readings exceed safe thresholds. Interface with an INA219 current sensor for precision current measurement."
 heroImage: "https://cdn.siliconwit.com/education/embedded-programming-stm32/adc-dma-analog-watchdog.png"
 ---
 
@@ -66,9 +66,7 @@ A monitor that reads a voltage from a potentiometer (a variable resistor turned 
 
 An ADC turns a voltage into a whole number. This one has 12 bits, so it divides the range from 0 V to the reference voltage (3.3 V here) into 4096 steps of about 0.8 mV. The result, called a code, runs from 0 to 4095.
 
-The ADC has one result register, `ADC1->DR`, and each conversion overwrites the last. A program that copies every result itself is interrupted thousands of times a second, and a late copy loses a reading.
-
-DMA (direct memory access) copies a value from a peripheral to memory with no processor instruction, like a clerk who files each form as it arrives. In scan mode the ADC converts a list of channels in order, and DMA puts each result in its own place in an array.
+The ADC has one result register, `ADC1->DR`, and each conversion overwrites the last; a program that copies each result itself loses one whenever it is late. DMA (direct memory access) copies each value to memory with no processor instruction, like a clerk who files each form as it arrives. In scan mode the ADC converts a list of channels in order, and DMA puts each result in its own place in an array.
 
 ```text
   ADC continuous scan with DMA:
@@ -209,7 +207,7 @@ void DMA1_Channel1_IRQHandler(void) {
 <InArticleAd />
 
 
-The main loop looks at the readings four times a second, so a voltage too high for 2 ms falls between two looks: a guard who looks into the room now and then, where you need a smoke alarm. The analog watchdog is that alarm: hardware in the ADC that compares every conversion with a high threshold (register `HTR`) and a low threshold (register `LTR`).
+The main loop looks four times a second, so a 2 ms rise falls between two looks: a guard who looks in now and then, where you need a smoke alarm. The analog watchdog is that alarm: hardware in the ADC that compares every conversion with a high threshold (register `HTR`) and a low threshold (register `LTR`).
 
 ```text
   ADC code
@@ -225,6 +223,8 @@ The main loop looks at the readings four times a second, so a voltage too high f
 ```
 
 A result above `HTR` or below `LTR` sets a flag and, if allowed, interrupts the program. No code runs for the comparison, so the alert comes within one scan (63 µs here).
+
+While the voltage stays high, every scan is out of range: about 16,000 interrupts a second. So the handler switches its interrupt off after the first alert, and the main loop switches it on again once the reading is 100 codes (about 80 mV) back inside the band.
 
 A threshold is a code, not a voltage. For a limit of 2.4 V: 2.4 / 3.3 × 4096 = 2979, rounded here to 3000.
 
@@ -251,16 +251,19 @@ void analog_watchdog_init(void) {
     NVIC_EnableIRQ(ADC1_2_IRQn);
 }
 
-volatile uint8_t threshold_alert = 0;
+volatile uint8_t threshold_alert = 0;  /* new alert, not yet printed */
+volatile uint8_t alert_active = 0;     /* 1 until the reading is back in the band */
 
 void ADC1_2_IRQHandler(void) {
     if (ADC1->SR & ADC_SR_AWD) {
-        ADC1->SR &= ~ADC_SR_AWD;  /* Clear flag */
+        ADC1->SR = ~ADC_SR_AWD;        /* Clear flag (it clears when 0 is written) */
+        ADC1->CR1 &= ~ADC_CR1_AWDIE;   /* One alert, not one every scan */
 
         threshold_alert = 1;
+        alert_active = 1;
 
-        /* Immediate response: flash alert LED */
-        GPIOC->ODR ^= (1 << 13);  /* Toggle PC13 */
+        /* Immediate response: alert LED on */
+        GPIOC->BRR = (1 << 13);        /* PC13 low = LED on */
     }
 }
 ```
@@ -326,28 +329,31 @@ Most boards carry a 0.1 Ω shunt. The chip accepts up to 320 mV across it, so th
 ```c
 #include <stdio.h>
 
-void i2c1_write_reg16(uint8_t addr, uint8_t reg, uint16_t val)
+/* i2c1_wait() and i2c1_fail() are the 10 ms time limit of the BME280 driver */
+int i2c1_write_reg16(uint8_t addr, uint8_t reg, uint16_t val)
 {
-    while (I2C1->SR2 & I2C_SR2_BUSY);
     I2C1->CR1 |= I2C_CR1_START;
-    while (!(I2C1->SR1 & I2C_SR1_SB));
+    if (!i2c1_wait(I2C_SR1_SB)) return i2c1_fail();
     I2C1->DR = addr << 1;
-    while (!(I2C1->SR1 & I2C_SR1_ADDR));
+    if (!i2c1_wait(I2C_SR1_ADDR)) return i2c1_fail();
     (void)I2C1->SR2;
     I2C1->DR = reg;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
     I2C1->DR = (val >> 8) & 0xFF;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
     I2C1->DR = val & 0xFF;
-    while (!(I2C1->SR1 & I2C_SR1_TXE));
+    if (!i2c1_wait(I2C_SR1_TXE)) return i2c1_fail();
     I2C1->CR1 |= I2C_CR1_STOP;
+    return 1;
 }
 
-uint16_t i2c1_read_reg16(uint8_t addr, uint8_t reg)
+/* Returns 1 with the value in *val, or 0 when the chip did not answer */
+int i2c1_read_reg16(uint8_t addr, uint8_t reg, uint16_t *val)
 {
     uint8_t buf[2];
-    i2c1_read_burst(addr, reg, buf, 2);
-    return (buf[0] << 8) | buf[1];
+    if (!i2c1_read_burst(addr, reg, buf, 2)) return 0;
+    *val = (buf[0] << 8) | buf[1];
+    return 1;
 }
 
 #define INA219_ADDR 0x40
@@ -379,13 +385,19 @@ void ina219_init(void) {
     i2c1_write_reg16(INA219_ADDR, INA219_REG_CALIB, 4096);
 }
 
+#define INA219_NOT_KNOWN  (-32768)  /* returned when the chip did not answer */
+
 int16_t ina219_read_current_ma(void) {
-    /* Current register LSB = 0.1 mA, so divide by 10 for mA */
-    return (int16_t)i2c1_read_reg16(INA219_ADDR, INA219_REG_CURRENT) / 10;
+    uint16_t raw;
+    if (!i2c1_read_reg16(INA219_ADDR, INA219_REG_CURRENT, &raw)) return INA219_NOT_KNOWN;
+    /* Current register LSB = 0.1 mA (signed): round to whole mA */
+    int16_t i = (int16_t)raw;
+    return (int16_t)((i >= 0 ? i + 5 : i - 5) / 10);
 }
 
-uint16_t ina219_read_bus_voltage_mv(void) {
-    uint16_t raw = i2c1_read_reg16(INA219_ADDR, INA219_REG_BUS_V);
+int32_t ina219_read_bus_voltage_mv(void) {
+    uint16_t raw;
+    if (!i2c1_read_reg16(INA219_ADDR, INA219_REG_BUS_V, &raw)) return INA219_NOT_KNOWN;
     /* Bus voltage is in bits [15:3], LSB = 4 mV */
     return (raw >> 3) * 4;
 }
@@ -453,25 +465,42 @@ int main(void) {
             uint16_t pot_adc = adc_values[0];
             uint32_t pot_mv = adc_to_mv(pot_adc);
             int32_t temp_c10 = adc_to_temp_c10(adc_values[1]);
-            uint32_t vref_mv = adc_to_mv(adc_values[2]);
+            long t = temp_c10 < 0 ? -(long)temp_c10 : (long)temp_c10;
+            /* Supply from Vrefint (1.20 V): VDDA = 1200 x 4096 / code */
+            uint32_t vdda_mv = 1200UL * 4096 / (adc_values[2] ? adc_values[2] : 1);
 
             int16_t current_ma = ina219_read_current_ma();
-            uint16_t bus_mv = ina219_read_bus_voltage_mv();
+            int32_t bus_mv = ina219_read_bus_voltage_mv();
 
             snprintf(buf, sizeof(buf),
-                "POT: %lumV (ADC:%u) | Temp: %ld.%ldC | "
-                "Vref: %lumV | I: %dmA | Vbus: %umV",
+                "POT: %lumV (ADC:%u) | Temp: %s%ld.%ldC | VDDA: %lumV | ",
                 (unsigned long)pot_mv, pot_adc,
-                (long)(temp_c10 / 10), (long)(temp_c10 % 10),
-                (unsigned long)vref_mv,
-                current_ma, bus_mv);
+                temp_c10 < 0 ? "-" : "", t / 10, t % 10,
+                (unsigned long)vdda_mv);
             uart_send_string(buf);
+
+            if (current_ma == INA219_NOT_KNOWN || bus_mv == INA219_NOT_KNOWN) {
+                uart_send_string("INA219: no answer");   /* no number is better than a wrong one */
+            } else {
+                snprintf(buf, sizeof(buf), "I: %dmA | Vbus: %ldmV",
+                         current_ma, (long)bus_mv);
+                uart_send_string(buf);
+            }
 
             if (threshold_alert) {
                 threshold_alert = 0;
                 uart_send_string(" [ALERT!]");
             }
             uart_send_string("\r\n");
+
+            /* Re-arm the watchdog once the reading is back in the band */
+            if (alert_active && pot_adc < AWD_HIGH_THRESHOLD - 100
+                             && pot_adc > AWD_LOW_THRESHOLD + 100) {
+                alert_active = 0;
+                GPIOC->BSRR = (1 << 13);        /* LED off */
+                ADC1->SR = ~ADC_SR_AWD;
+                ADC1->CR1 |= ADC_CR1_AWDIE;
+            }
         }
 
         __WFI();
@@ -479,8 +508,15 @@ int main(void) {
 }
 ```
 
+### Check it
+
+- A multimeter on PA0 agrees with `POT` within about 1 percent. `VDDA` reads 3200 to 3400 mV (Vrefint is specified to about 3 percent).
+- Above 2.4 V: one `[ALERT!]` line and the LED stays on. Below about 2.3 V the LED goes off, and the next crossing gives one new alert.
+- The INA219 feeding a 100 ohm resistor from 3.3 V shows about 33 mA, and `I` equals `Vbus` / 100 within a few percent.
+- The internal temperature sensor differs from chip to chip by up to about 0.09 V either way at 25 C (about 20 degrees). Trust its changes, not its value: a warm finger raises it within seconds.
+
 :::tip[Instrument it]
-The analog watchdog watches an ADC channel and interrupts the program when a reading leaves a safe band, and the processor does no checking of its own. Connect the analog output of a vibration sensor or a current sensor to that channel and the limit is checked on every conversion, which suits a motor or a pump. The [STM32](/education/sensor-actuator-interfacing-stm32/) acts locally, for example by opening a relay, and can [raise the alarm](https://siliconwit.io) so that a person sees it too.
+Put the analog output of a vibration or current sensor on the watched channel and its limit is checked on every conversion with no processor work, which suits a motor or a pump. The [STM32](/education/sensor-actuator-interfacing-stm32/) acts locally, for example by opening a relay, and can [raise the alarm](https://siliconwit.io) so that a person sees it too.
 :::
 
 ## What You Have Learned
@@ -488,7 +524,7 @@ The analog watchdog watches an ADC channel and interrupts the program when a rea
 <InArticleAd />
 
 
-<Card title="Lesson 6 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
 **ADC:**
 - A 12-bit code is a step count: voltage = code × 3.3 V / 4096
@@ -507,7 +543,7 @@ The analog watchdog watches an ADC channel and interrupts the program when a rea
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 7: Debugging with SWD, GDB, and Fault Handlers](/education/embedded-programming-stm32/debugging-swd-gdb-fault-handlers), you use a debugger to find and fix five bugs in firmware that are very hard to find by reading the code.
+In [Debugging with SWD, GDB, and Fault Handlers](/education/embedded-programming-stm32/debugging-swd-gdb-fault-handlers/), you use a debugger to find and fix five bugs in firmware that are very hard to find by reading the code.
 :::
 
 <EmbeddedProgrammingStm32Comments />

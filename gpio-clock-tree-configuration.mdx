@@ -54,7 +54,7 @@ A menu on a serial terminal, sent over a UART (a serial port) at 115200 baud. A 
 | KY-040 rotary encoder module | 1 | Includes pull-up resistors on the module |
 | Breadboard | 1 | As used for the breathing LED |
 | Jumper wires | 5+ | For connections |
-| USB-to-serial adapter (optional) | 1 | If not using ST-Link virtual COM |
+| USB-to-serial adapter, 3.3 V | 1 | Needed: the ST-Link V2 clone has no serial port |
 
 ## The RCC Clock Tree
 
@@ -228,7 +228,12 @@ Turned counterclockwise, DT changes first. At the moment CLK falls, DT is alread
   CLK falls here, DT = 0
 ```
 
-So the program reads DT at each fall of CLK: 1 is clockwise, 0 counterclockwise. The push button (SW) is active-low: 0 when pressed. A mechanical contact bounces for a few milliseconds and gives several edges per press, so the code ignores a new press for 50 ms (debouncing).
+So the program reads DT at each fall of CLK: 1 is clockwise, 0 counterclockwise. The push button (SW) is active-low: 0 when pressed.
+
+A mechanical contact bounces: it opens and closes several times in a millisecond or so, and the fast loop sees every bounce. Two rules ignore them (debouncing):
+
+- A fall of CLK counts only after 2 ms of steady high. Its bounces come less than a millisecond apart.
+- A press counts only at the change from released to pressed, 50 ms after the last change, so holding the button gives one press.
 
 ### Wiring
 
@@ -246,6 +251,8 @@ So the program reads DT at each fall of CLK: 1 is clockwise, 0 counterclockwise.
 typedef struct {
     int16_t position;
     uint8_t last_clk;
+    uint32_t clk_change_time;   /* when CLK last changed */
+    uint8_t last_sw;
     uint8_t button_pressed;
     uint32_t last_button_time;
 } encoder_t;
@@ -255,34 +262,43 @@ void encoder_init(encoder_t *enc) {
     RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
 
     /* PB5, PB6, PB7 as input with pull-up */
-    GPIOB->CRL &= ~(0xFFF << 20);      /* Clear config for PB5, PB6, PB7 */
-    GPIOB->CRL |=  (0x888 << 20);      /* Input with pull-up/pull-down */
+    GPIOB->CRL &= ~(0xFFFU << 20);     /* Clear config for PB5, PB6, PB7 */
+    GPIOB->CRL |=  (0x888U << 20);     /* Input with pull-up/pull-down */
     GPIOB->ODR |=  (1 << 5) | (1 << 6) | (1 << 7);  /* Select pull-up */
 
     enc->position = 0;
     enc->last_clk = (GPIOB->IDR >> 6) & 1;
+    enc->clk_change_time = 0;
+    enc->last_sw = 1;                  /* released */
     enc->button_pressed = 0;
     enc->last_button_time = 0;
 }
 
 void encoder_update(encoder_t *enc, uint32_t tick_ms) {
-    uint8_t clk = (GPIOB->IDR >> 6) & 1;
-    uint8_t dt  = (GPIOB->IDR >> 7) & 1;
-    uint8_t sw  = (GPIOB->IDR >> 5) & 1;
+    uint32_t idr = GPIOB->IDR;         /* read the three pins at one instant */
+    uint8_t clk = (idr >> 6) & 1;
+    uint8_t dt  = (idr >> 7) & 1;
+    uint8_t sw  = (idr >> 5) & 1;
 
-    /* Detect CLK falling edge */
-    if (enc->last_clk == 1 && clk == 0) {
-        if (dt == 1) {
-            enc->position++;    /* Clockwise */
-        } else {
-            enc->position--;    /* Counterclockwise */
+    /* CLK changed: count a fall only after 2 ms of steady high */
+    if (clk != enc->last_clk) {
+        if (clk == 0 && (tick_ms - enc->clk_change_time) >= 2) {
+            if (dt == 1) {
+                enc->position++;    /* Clockwise */
+            } else {
+                enc->position--;    /* Counterclockwise */
+            }
         }
+        enc->clk_change_time = tick_ms;
+        enc->last_clk = clk;
     }
-    enc->last_clk = clk;
 
-    /* Button with 50ms debounce */
-    if (sw == 0 && (tick_ms - enc->last_button_time) > 50) {
-        enc->button_pressed = 1;
+    /* Button: count the change to pressed, 50 ms after the last change */
+    if (sw != enc->last_sw && (tick_ms - enc->last_button_time) > 50) {
+        if (sw == 0) {
+            enc->button_pressed = 1;
+        }
+        enc->last_sw = sw;
         enc->last_button_time = tick_ms;
     }
 }
@@ -412,11 +428,8 @@ int main(void) {
             int16_t delta = enc.position - last_position;
             last_position = enc.position;
 
-            menu_index += delta;
-
-            /* Wrap around */
-            if (menu_index < 0) menu_index = MENU_ITEMS - 1;
-            if (menu_index >= MENU_ITEMS) menu_index = 0;
+            /* Wrap around, also when several steps arrive at once */
+            menu_index = ((menu_index + delta) % MENU_ITEMS + MENU_ITEMS) % MENU_ITEMS;
 
             menu_display(menu_index);
         }
@@ -453,6 +466,14 @@ The transmit pin (TX) of one device goes to the receive pin (RX) of the other.
 ```
 
 Open a serial terminal at 115200 baud and the menu appears. Turning the encoder scrolls; pressing it prints the selected item.
+
+### Check it
+
+- Turn the knob slowly one full turn. A KY-040 usually has 20 clicks a turn, so the menu goes round its 5 items four times and stops where it started. Anywhere else means lost or doubled steps: check the wiring of CLK and DT.
+- Hold the button for two seconds: one "Selected" line, not many.
+- Unreadable characters mean a wrong clock, not a wrong program. Without the crystal the chip sends at 8,000,000 / 625 = 12,800 baud.
+
+A redraw takes about 16 ms (188 characters at 115200 baud) and the encoder is not read meanwhile, so a fast spin can lose steps. The timer's encoder mode in the next lesson counts in hardware.
 
 ## What You Have Learned
 

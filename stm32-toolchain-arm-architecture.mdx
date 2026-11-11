@@ -54,7 +54,7 @@ An LED whose brightness rises and falls smoothly. PWM (pulse width modulation) s
 | ST-Link V2 clone | 1 | Writes your program into the chip |
 | Breadboard | 1 | Full-size or half-size |
 | LED (any color, 3mm or 5mm) | 1 | External LED on PA0 |
-| 330 ohm resistor | 1 | Limits the LED current to about 4 mA (a pin should give about 8 mA at most) |
+| 330 ohm resistor | 1 | About 4 mA in a red LED (a pin should give 8 mA at most); use 100 ohm for blue or white |
 | Jumper wires | 4+ | For connections |
 
 ## Installing the ARM Toolchain
@@ -68,7 +68,7 @@ The compiler `arm-none-eabi-gcc` runs on your PC but produces code for the ARM c
 ```bash
 # ARM GCC cross-compiler
 sudo apt update
-sudo apt install gcc-arm-none-eabi gdb-multiarch
+sudo apt install gcc-arm-none-eabi libnewlib-arm-none-eabi gdb-multiarch
 
 # OpenOCD for flashing and debugging
 sudo apt install openocd
@@ -84,8 +84,8 @@ openocd --version
 </TabItem>
 <TabItem label="macOS">
 ```bash
-# Using Homebrew
-brew install arm-none-eabi-gcc
+# Using Homebrew (the cask is ARM's own toolchain, with the C library)
+brew install --cask gcc-arm-embedded
 brew install open-ocd
 
 # Verify
@@ -141,6 +141,8 @@ openocd -f interface/stlink.cfg -f target/stm32f1x.cfg
 
 You should see output ending with something like `Info : stm32f1x.cpu: hardware has 6 breakpoints, 4 watchpoints`. Press `Ctrl+C` to exit.
 
+If OpenOCD cannot find `interface/stlink.cfg`, your version is 0.10: use `interface/stlink-v2.cfg`. If it reports `UNEXPECTED idcode: 0x2ba01477`, the board carries a copy of the chip (CKS32 or CS32): add `-c "set CPUTAPID 0x2ba01477"` before the target file.
+
 ## ARM Cortex-M3 Architecture Overview
 
 <InArticleAd />
@@ -161,13 +163,7 @@ The core reaches the program, the variables and the hardware through addresses, 
 
 ### Vector Table
 
-After reset the core does not know where your program is. It reads a list of addresses, the vector table, at 0x0000_0000, which shows the same memory as the start of flash (0x0800_0000).
-
-- Entry 1: the starting value of the stack pointer. The stack is the RAM that holds local variables and return addresses; no C function runs without it.
-- Entry 2: the address of the reset handler, the first code to run.
-- The rest: the addresses of the fault and interrupt handlers.
-
-The hardware loads the first two entries before any code runs:
+After reset the core does not know where your program is. It reads a list of addresses, the vector table, at 0x0000_0000, which shows the same memory as the start of flash (0x0800_0000) while the BOOT0 jumper is at 0. (At 1, ST's built-in loader runs instead of your program.) The first entry is the starting stack pointer; the stack is the RAM that holds local variables and return addresses, and no C function runs without it. The second is the address of the reset handler. The rest are the addresses of the fault and interrupt handlers. The hardware loads the first two before any code runs:
 
 ```text
   1. Read word at 0x0000_0000 --> MSP
@@ -196,10 +192,10 @@ uint32_t vector_table[] = {
 
 The reset handler is the startup code. C expects global variables to be ready when `main()` begins, but after power-on RAM holds nothing useful. So the startup code:
 
-1. Copies the starting values of initialized globals from flash, which keeps them without power, to RAM, where the program can change them (the `.data` section).
-2. Fills with zero the globals that have no starting value (the `.bss` section).
-3. Calls `SystemInit()`, supplied with the device files, which puts the clocks in a known state.
-4. Calls `main()`.
+1. Calls `SystemInit()` from the device files (in current ST files it only sets where the vector table is). No global variable is ready yet.
+2. Copies the starting values of initialized globals from flash, which keeps them without power, to RAM, where the program can change them (the `.data` section).
+3. Fills with zero the globals that have no starting value (the `.bss` section).
+4. Calls the C library's start code (`__libc_init_array()`), then `main()`.
 
 ### Linker Script
 
@@ -224,6 +220,7 @@ SECTIONS
         *(.rodata*)
     } > FLASH
 
+    _sidata = LOADADDR(.data);   /* where the starting values sit in flash */
     .data : {
         _sdata = .;
         *(.data*)
@@ -240,7 +237,7 @@ SECTIONS
 _estack = ORIGIN(RAM) + LENGTH(RAM);
 ```
 
-The last line is the first entry of the vector table: the end of RAM, 0x2000_0000 + 20 KB = 0x2000_5000. The stack starts there and grows downward.
+The last line is the first entry of the vector table: the end of RAM, 0x2000_0000 + 20 KB = 0x2000_5000. The stack starts there and grows downward. The startup code finds what to copy and what to zero through the names `_sidata` to `_ebss`. For the build, take ST's complete `STM32F103XB_FLASH.ld` (STM32CubeF1, `Drivers/CMSIS/Device/ST/STM32F1xx/Source/Templates/gcc/linker/`), save it as `STM32F103C8Tx_FLASH.ld` and set flash to 64K.
 
 ## Building the Breathing LED
 
@@ -285,13 +282,15 @@ A bus is a set of internal lines that carries a clock and data to a group of per
 
 One rule surprises most people: when the APB1 clock is divided, the chip doubles the clock it gives to the timers on that bus. So TIM2 counts from 72 MHz, and the timer code below depends on this.
 
-In the code, each `while` line waits for a ready bit.
+In the code, each wait is for a ready bit. The crystal can fail (a bad joint), so its wait has a limit: the function returns and the chip stays on the internal 8 MHz clock.
 
 ```c
 void clock_init(void) {
-    /* Enable HSE (external 8 MHz crystal) */
+    /* Enable HSE (external 8 MHz crystal); it needs about 2 ms */
     RCC->CR |= RCC_CR_HSEON;
-    while (!(RCC->CR & RCC_CR_HSERDY));
+    for (uint32_t t = 0; !(RCC->CR & RCC_CR_HSERDY); t++) {
+        if (t > 200000) return;   /* no crystal: stay on the 8 MHz HSI */
+    }
 
     /* Configure flash latency for 72 MHz (2 wait states, LATENCY = 010) */
     FLASH->ACR |= FLASH_ACR_LATENCY_1;  /* Bit 1 of the field = value 2 */
@@ -347,7 +346,7 @@ void pwm_init(void) {
 
 ### Main Loop (Breathing Effect)
 
-The loop changes `CCR1` by one count on each pass, from 0 up to 999 and down again. The timer does the rest.
+The loop changes `CCR1` by one count on each pass, from 0 up to 999 and down again. The timer also keeps the time: it sets its update flag `UIF` at the end of each 1 ms period, and the loop waits for it. One breath is 999 steps up and 999 down, 1,998 ms. An empty counting loop would give a time that changes with the compiler settings.
 
 ```c
 #include "stm32f103xb.h"
@@ -361,7 +360,6 @@ int main(void) {
 
     uint16_t brightness = 0;
     int8_t direction = 1;
-    uint32_t step_delay = 2000;  /* Adjust for breathing speed */
 
     while (1) {
         TIM2->CCR1 = brightness;
@@ -373,8 +371,10 @@ int main(void) {
             direction = 1;
         }
 
-        /* Simple delay (replaced by the SysTick timer when you build the menu) */
-        for (volatile uint32_t i = 0; i < step_delay; i++);
+        /* Wait for the end of this 1 ms PWM period, then clear the flag
+           (the SysTick timer takes this job when you build the menu) */
+        while (!(TIM2->SR & TIM_SR_UIF));
+        TIM2->SR = ~TIM_SR_UIF;
     }
 }
 ```
@@ -390,14 +390,16 @@ CFLAGS = -mcpu=cortex-m3 -mthumb -Os -Wall -g
 CFLAGS += -DSTM32F103xB
 CFLAGS += -Iinclude
 
-LDFLAGS = -T STM32F103C8Tx_FLASH.ld -nostdlib -lc -lgcc
+# nano.specs: the small C library; nosys.specs: no operating system
+LDFLAGS = -T STM32F103C8Tx_FLASH.ld --specs=nano.specs --specs=nosys.specs
+LDFLAGS += -Wl,--gc-sections
 
 SRCS = src/main.c src/system_stm32f1xx.c src/startup_stm32f103.s
 
 all: $(TARGET).bin
 
 $(TARGET).elf: $(SRCS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 $(TARGET).bin: $(TARGET).elf
 	$(OBJCOPY) -O binary $< $@
@@ -427,6 +429,13 @@ make flash
 ```
 
 `make flash` writes the program at 0x0800_0000, the start of flash. The LED on PA0 should now rise and fall smoothly. If it blinks instead, check the PA0 wiring and the timer configuration.
+
+### Check it
+
+"It breathes" does not prove the clock is right. Two checks do:
+
+1. Time ten breaths with a phone stopwatch: about 20 s. About 180 s means the crystal did not start, so the timer counts from 8 MHz instead of 72 MHz.
+2. Hold `TIM2->CCR1 = 500;` for a moment and measure PA0 to GND with a multimeter (DC volts): about 1.65 V, half of 3.3 V. A Hz range reads 1,000 Hz (111 Hz: no crystal). 0 V or 3.3 V means the timer is not driving the pin: check the clock enables and `CRL`.
 
 ## Exploring with STM32CubeMX
 

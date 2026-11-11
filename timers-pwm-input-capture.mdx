@@ -96,7 +96,7 @@ Center-aligned: 0 -> 1 -> ... -> ARR -> ARR-1 -> ... -> 0 -> 1 -> ...
 <InArticleAd />
 
 
-PWM (pulse width modulation) repeats with a fixed period and is high for part of each period. A hobby servo expects 20 ms (50 Hz), and the pulse width sets the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), 2.5 ms for 180 degrees. These values are safe for nearly all servos, the SG90 included.
+PWM (pulse width modulation) repeats with a fixed period and is high for part of each period. A hobby servo expects 20 ms (50 Hz), and the pulse width sets the angle: 0.5 ms for 0 degrees, 1.5 ms for 90 degrees (center), 2.5 ms for 180 degrees. The SG90 and many small servos turn about 180 degrees over this range; the standard range every servo accepts is only 1 to 2 ms. A servo that buzzes at an end is pushing against its stop and heats: narrow the range in `servo_set_angle()`.
 
 ```text
   |<------------- 20 ms ------------->|
@@ -200,7 +200,7 @@ No step is lost when the CPU is busy, which is why motor control uses this mode.
 
 ### Encoder Mode Configuration
 
-Three choices need a reason. Encoder mode 3 counts every edge of both signals, so one KY-040 click gives 4 counts. The input filter accepts an edge only after 8 equal samples, which removes contact bounce. The counter starts at 32,768, the middle of its 16-bit range, so it can move both ways without passing zero.
+Three choices need a reason. Encoder mode 3 counts every edge of both signals, so one KY-040 click gives 4 counts. The input filter needs 8 equal samples at 72 MHz (about 0.1 µs), so it removes electrical spikes, not contact bounce. Bounce does no harm here: only one signal changes at a time, so each bounce counts one step forward and one back. The counter starts at 32,768, the middle of its 16-bit range, so it can move both ways without passing zero.
 
 ```c
 void encoder_hw_init(void) {
@@ -226,7 +226,7 @@ void encoder_hw_init(void) {
     TIM3->CCMR1 &= ~(TIM_CCMR1_CC1S | TIM_CCMR1_CC2S);
     TIM3->CCMR1 |= TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0;
 
-    /* Input filter: IC1F = IC2F = 0011, 8 samples at fCK_INT (glitch rejection) */
+    /* Input filter: IC1F = IC2F = 0011, 8 samples at fCK_INT (rejects spikes under 0.1 us) */
     TIM3->CCMR1 |= (0x3 << 4) | (0x3 << 12);
 
     /* Set auto-reload to maximum for free-running counter */
@@ -277,12 +277,15 @@ Input capture measures pulse widths, frequencies and the time between events. Th
 
 ### Measuring a Signal Period
 
-The 16-bit counter returns to 0 after 65,535; the `& 0xFFFF` in the handler keeps the difference correct when that happens between two captures. At 1 microsecond per count, the longest period this code can measure is 65.5 ms.
+The 16-bit counter returns to 0 after 65,535; the 16-bit subtraction in the handler keeps the difference correct when that happens between two captures. At 1 microsecond per count, a period over 65.5 ms cannot be told apart (100 ms reads as 34.5 ms). So the handler notes the SysTick time of each capture and gives 0, meaning "not known", for the first edge, for gaps of 60 ms or more, and once the signal stops. Otherwise a stopped shaft would keep showing its last speed.
 
 ```c
-volatile uint32_t capture_value = 0;
-volatile uint32_t last_capture = 0;
-volatile uint32_t period_ticks = 0;
+extern volatile uint32_t systick_ms;      /* the 1 ms count from the menu program */
+
+volatile uint32_t period_ticks = 0;       /* 0 = not known */
+volatile uint32_t last_capture_ms = 0;
+static uint16_t last_capture;
+static uint8_t have_last = 0;
 
 void input_capture_init(void) {
     /* TIM4 CH1 on PB6 as input capture */
@@ -313,12 +316,24 @@ void input_capture_init(void) {
 
 void TIM4_IRQHandler(void) {
     if (TIM4->SR & TIM_SR_CC1IF) {
-        TIM4->SR &= ~TIM_SR_CC1IF;
+        uint16_t now = TIM4->CCR1;        /* reading CCR1 also clears CC1IF */
+        uint32_t gap_ms = systick_ms - last_capture_ms;
 
-        capture_value = TIM4->CCR1;
-        period_ticks = (capture_value - last_capture) & 0xFFFF;  /* 16-bit counter wraps */
-        last_capture = capture_value;
+        if (have_last && gap_ms < 60) {
+            period_ticks = (uint16_t)(now - last_capture);  /* 16-bit counter wraps */
+        } else {
+            period_ticks = 0;             /* first edge, or too long to measure */
+        }
+        last_capture = now;
+        last_capture_ms = systick_ms;
+        have_last = 1;
     }
+}
+
+/* Period in microseconds; 0 when no edge came in the last 60 ms */
+uint32_t period_us(void) {
+    if (systick_ms - last_capture_ms >= 60) return 0;
+    return period_ticks;
 }
 ```
 
@@ -344,6 +359,7 @@ void servo_pwm_init(void);
 void servo_set_angle(uint16_t angle);
 void encoder_hw_init(void);
 int16_t encoder_hw_read(void);
+extern volatile uint32_t systick_ms;
 
 /* Simple integer-to-string conversion */
 void itoa_simple(int32_t val, char *buf) {
@@ -370,6 +386,8 @@ int main(void) {
 
     int16_t last_encoder = 0;
     uint16_t servo_angle = 90;  /* Start centered */
+    uint8_t was_pressed = 0;
+    uint32_t button_change_ms = 0;
     char buf[32];
 
     uart_send_string("Servo Pan Controller Ready\r\n");
@@ -403,13 +421,16 @@ int main(void) {
             uart_send_string("\r\n");
         }
 
-        /* Button press: return to center */
-        if (!(GPIOB->IDR & (1 << 5))) {
-            servo_angle = 90;
-            servo_set_angle(90);
-            uart_send_string(">> Centered at 90 degrees\r\n");
-            /* Simple debounce delay */
-            for (volatile uint32_t i = 0; i < 200000; i++);
+        /* Button: center once per press (debounced as in the menu program) */
+        uint8_t pressed = !(GPIOB->IDR & (1 << 5));
+        if (pressed != was_pressed && (systick_ms - button_change_ms) > 50) {
+            was_pressed = pressed;
+            button_change_ms = systick_ms;
+            if (pressed) {
+                servo_angle = 90;
+                servo_set_angle(90);
+                uart_send_string(">> Centered at 90 degrees\r\n");
+            }
         }
     }
 }
@@ -432,8 +453,14 @@ int main(void) {
 PA0 carries only the signal: a pin gives about 8 mA at most, and the SG90 draws up to 500 mA under load, so motor power comes from the red 5V wire. USB power through the Blue Pill may not be enough, especially if the servo stalls. Use a separate 5V supply with its ground joined to the Blue Pill ground.
 :::
 
+### Check it
+
+1. Press the button, then turn ten clicks clockwise: the encoder value rises by 40 and the line ends `Angle: 170` and `Pulse: 2388 us`. Four degrees a click means your encoder gives 2 counts a click.
+2. Let one timer measure the other: wire PA0 to PB6, call `input_capture_init()` after `systick_init()`, and print `period_us()` each second. Expect 20000, one count either way. (Both timers share one clock, so this checks PSC and ARR, not the crystal.)
+3. Pull that wire: `period_us()` gives 0 within 60 ms, not the last 20000.
+
 :::tip[Instrument it]
-Input capture and the encoder interface are not just motor-control plumbing, they are measurement. Input capture times the gap between pulses, so a Hall sensor or optical pickup turns into a tachometer reading true RPM; the encoder interface counts position and direction with no CPU load, so a servo can confirm it actually reached the angle it was told. An [STM32](/education/sensor-actuator-interfacing-stm32/) closes that loop, and can [stream](/education/iot-systems/) speed and position to a [dashboard](https://siliconwit.io) so drift, slip, or a stalled axis shows up immediately.
+Input capture and the encoder interface also measure. With a Hall sensor or optical pickup, input capture is a tachometer that reads 0 when the shaft stops; an encoder on a shaft gives position and direction, so firmware can confirm an axis reached its target. The [STM32](/education/sensor-actuator-interfacing-stm32/) closes that loop itself and can [stream](/education/iot-systems/) speed and position to a [dashboard](https://siliconwit.io), where drift, slip or a stalled axis shows.
 :::
 
 ## What You Have Learned

@@ -44,7 +44,7 @@ A data logger powered by a CR2032 coin cell (3V, ~220 mAh). Between measurements
 | Sensor | BME280 on I2C1 (forced mode, then sleep) |
 | Storage | W25Q32 SPI flash (4 MB, ~262,000 log entries) |
 | Log entry size | 16 bytes (timestamp + temp + pressure + humidity + battery, padded) |
-| Serial interface | USART1 for data retrieval (wakeup on RX activity) |
+| Serial interface | USART1 for data retrieval (type `d` in the 10 s after a reset) |
 | Target battery life | 6+ months on CR2032 |
 
 ### Bill of Materials
@@ -116,6 +116,8 @@ Battery life:       220,000 uAh / 26.5 uA = ~8,302 hours = ~11 months
 
 The 60 seconds of sleep use 839 uAs and the 50 ms awake use 750 uAs, so the sleep current costs slightly more than the work. Real losses (the regulator's own current, flash chip leakage, the cell's self-discharge) reduce the 11 months, which is why the target is 6 months.
 
+Measure rather than trust two of these numbers. At 72 MHz the awake current may be nearer 30 mA (then about 39 uA and 7.7 months). A CR2032's 220 mAh is rated at about 0.2 mA, and pulses of 15 to 30 mA make its voltage dip, more as it ages: put a 100 uF capacitor across it. The sector erase every 256 entries adds under 1 uA.
+
 ## RTC Configuration and Alarm Wakeup
 
 <InArticleAd />
@@ -137,7 +139,7 @@ A prescaler divides 32768 Hz down to 1 Hz, so the counter rises by one each seco
 
 ### RTC Initialization
 
-The RTC is in the backup domain, a small part of the chip that is write-protected so that a program fault cannot spoil the time. The code must first unlock it (the `DBP` bit) and then enter a configuration mode (the `CNF` bit) before each change.
+The RTC is in the backup domain, a small part of the chip that is write-protected so that a program fault cannot spoil the time. The code must first unlock it (the `DBP` bit) and then enter a configuration mode (the `CNF` bit) before each change. The backup domain survives a reset while power stays, so a running RTC is left alone.
 
 ```c
 void rtc_init(void) {
@@ -147,13 +149,32 @@ void rtc_init(void) {
     /* Enable access to backup domain */
     PWR->CR |= PWR_CR_DBP;
 
-    /* Enable LSE */
-    RCC->BDCR |= RCC_BDCR_LSEON;
-    while (!(RCC->BDCR & RCC_BDCR_LSERDY));
+    /* Already running (a reset with power kept): keep its count */
+    if (RCC->BDCR & RCC_BDCR_RTCEN) {
+        RTC->CRL &= ~RTC_CRL_RSF;
+        while (!(RTC->CRL & RTC_CRL_RSF));
+        return;
+    }
 
-    /* Select LSE as RTC clock source */
-    RCC->BDCR |= RCC_BDCR_RTCSEL_0;  /* LSE */
-    RCC->BDCR |= RCC_BDCR_RTCEN;     /* Enable RTC */
+    /* Enable LSE; it can take a second or more to start, and on some
+     * low-cost boards it never does */
+    uint32_t prescaler = 32768 - 1;
+    RCC->BDCR |= RCC_BDCR_LSEON;
+    for (uint32_t t = 0; !(RCC->BDCR & RCC_BDCR_LSERDY); t++) {
+        if (t > 20000000) break;         /* about 2 s at 72 MHz */
+    }
+
+    if (RCC->BDCR & RCC_BDCR_LSERDY) {
+        RCC->BDCR |= RCC_BDCR_RTCSEL_0;  /* LSE */
+    } else {
+        /* No crystal: the internal ~40 kHz LSI keeps the logger running,
+         * but it is only accurate to tens of percent */
+        RCC->CSR |= RCC_CSR_LSION;
+        while (!(RCC->CSR & RCC_CSR_LSIRDY));
+        RCC->BDCR |= RCC_BDCR_RTCSEL_1;  /* LSI */
+        prescaler = 40000 - 1;
+    }
+    RCC->BDCR |= RCC_BDCR_RTCEN;         /* Enable RTC */
 
     /* Wait for RTC synchronization */
     while (!(RTC->CRL & RTC_CRL_RSF));
@@ -162,9 +183,9 @@ void rtc_init(void) {
     while (!(RTC->CRL & RTC_CRL_RTOFF));
     RTC->CRL |= RTC_CRL_CNF;
 
-    /* Set prescaler for 1 Hz (32768 - 1) */
-    RTC->PRLH = 0;
-    RTC->PRLL = 32767;
+    /* Set prescaler for 1 Hz (32768 - 1 with the LSE) */
+    RTC->PRLH = prescaler >> 16;
+    RTC->PRLL = prescaler & 0xFFFF;
 
     /* Set counter to 0 */
     RTC->CNTH = 0;
@@ -243,6 +264,9 @@ void enter_stop_mode(void) {
     /* Clear wakeup flag */
     PWR->CR |= PWR_CR_CWUF;
 
+    /* A SysTick interrupt pending at this moment would end the sleep at once */
+    SysTick->CTRL &= ~SysTick_CTRL_ENABLE_Msk;
+
     /* Enter Stop mode (WFI = Wait For Interrupt) */
     __WFI();
 
@@ -250,6 +274,7 @@ void enter_stop_mode(void) {
 
     /* Reconfigure clock (HSE + PLL, since Stop mode reverts to HSI) */
     clock_init();
+    SysTick->CTRL |= SysTick_CTRL_ENABLE_Msk;
 
     /* Clear deep sleep bit */
     SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
@@ -311,11 +336,18 @@ void w25q_write_enable(void) {
     W25Q_CS_HIGH();
 }
 
-void w25q_wait_busy(void) {
+/* Returns 1 when the chip is ready, 0 after 500 ms (longer than the
+ * slowest sector erase): a missing chip can read as busy for ever */
+int w25q_wait_busy(void) {
+    uint32_t start = systick_ms;
+    int ok = 1;
     W25Q_CS_LOW();
     spi1_transfer(0x05);
-    while (spi1_transfer(0xFF) & 0x01);  /* Wait until BUSY clears */
+    while (spi1_transfer(0xFF) & 0x01) {  /* Wait until BUSY clears */
+        if (systick_ms - start > 500) { ok = 0; break; }
+    }
     W25Q_CS_HIGH();
+    return ok;
 }
 
 void w25q_sector_erase(uint32_t addr) {
@@ -433,53 +465,94 @@ void log_write_entry(const log_entry_t *entry) {
 ### Main Loop
 
 ```c
+/* BME280 ctrl_meas (0xF4): temperature x1, pressure x1, mode in bits 1:0 */
+int bme280_force_measurement(void) { return i2c1_write_reg(0x76, 0xF4, 0x25); }
+int bme280_sleep(void)             { return i2c1_write_reg(0x76, 0xF4, 0x24); }
+
+/* The cell feeds the chip directly, so the battery voltage is VDDA:
+ * VDDA = 1200 mV x 4096 / Vrefint code, as in the ADC lesson */
+uint16_t read_battery_voltage(void) {
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_ADCPRE) | RCC_CFGR_ADCPRE_DIV6;  /* 12 MHz */
+    ADC1->CR2 = ADC_CR2_ADON | ADC_CR2_TSVREFE;  /* power on, Vrefint on */
+    ADC1->SMPR1 = 0x7 << 21;                     /* CH17: 239.5 cycles */
+    ADC1->SQR3 = 17;
+    for (volatile int i = 0; i < 1000; i++);     /* settle (over 10 us) */
+    ADC1->CR2 |= ADC_CR2_ADON;                   /* start one conversion */
+    uint32_t start = systick_ms;
+    while (!(ADC1->SR & ADC_SR_EOC)) {
+        if (systick_ms - start > 2) return 0;    /* 0 = not known */
+    }
+    uint16_t code = ADC1->DR;
+    ADC1->CR2 = 0;                               /* ADC off while asleep */
+    return code ? (uint16_t)(1200UL * 4096 / code) : 0;
+}
+
 int main(void) {
     clock_init();
-    rtc_init();
+    systick_init();                  /* 1 ms count for the time limits */
+    rtc_init();                      /* keeps the count after a reset */
     spi1_init();
     i2c1_init();
     uart_init();
+    USART1->CR1 |= USART_CR1_RE;     /* receive too, for the dump command */
+    w25q_wake();
 
-    /* Check if this is a fresh boot or wakeup from Stop */
-    if (!(PWR->CSR & PWR_CSR_WUF)) {
-        /* Fresh boot: initialize everything */
-        set_write_pointer(FLASH_LOG_START);
-        uart_send_string("Data logger initialized.\r\n");
-        uart_send_string("Commands: dump, status, reset\r\n");
+    /* A reset (button, watchdog) must not restart the log. The backup
+     * registers survive it while power stays; a marker in DR3 says so.
+     * Without the marker, find the first empty entry in flash (correct
+     * until the log first wraps around). */
+    if (BKP->DR3 != 0xA5A5) {
+        uint32_t addr = FLASH_LOG_START, ts;
+        for (; addr < FLASH_LOG_END; addr += ENTRY_SIZE) {
+            w25q_read(addr, (uint8_t *)&ts, 4);
+            if (ts == 0xFFFFFFFF) break;
+        }
+        set_write_pointer(addr < FLASH_LOG_END ? addr : FLASH_LOG_START);
+        BKP->DR3 = 0xA5A5;
+    }
+    int sensor_ok = bme280_init();
+
+    /* After a reset, listen 10 s: press reset, then type d to dump */
+    uart_send_string("Data logger. Type d within 10 s to dump the log.\r\n");
+    for (uint32_t start = systick_ms; systick_ms - start < 10000; ) {
+        if ((USART1->SR & USART_SR_RXNE) && USART1->DR == 'd') {
+            cmd_dump_log();
+            break;
+        }
     }
 
     while (1) {
         /* Wake flash and sensor */
         w25q_wake();
+        if (!sensor_ok) sensor_ok = bme280_init();
         bme280_force_measurement();
 
-        /* Wait for BME280 measurement (~10 ms) */
-        for (volatile int i = 0; i < 100000; i++);
+        /* Wait for BME280 measurement (9.3 ms at most with x1 settings) */
+        uint32_t start = systick_ms;
+        while (systick_ms - start < 12);
 
-        /* Read sensor data */
-        int32_t temp, press, hum;
-        bme280_read(&temp, (uint32_t *)&press, (uint32_t *)&hum);
+        /* Read sensor data; on failure store "not known" markers */
+        int32_t temp = 0;
+        uint32_t press = 0, hum = 0;
+        int fresh = sensor_ok && bme280_read(&temp, &press, &hum);
+        if (!fresh) sensor_ok = 0;
 
         /* Read battery voltage via ADC */
         uint16_t batt_mv = read_battery_voltage();
 
-        /* Create log entry */
+        /* Create log entry (rounded, not cut off, to one decimal) */
         log_entry_t entry = {
             .timestamp = ((uint32_t)RTC->CNTH << 16) | RTC->CNTL,
-            .temperature_c10 = (int16_t)(temp / 10),
-            .pressure_hpa10 = (uint16_t)(press / 10),
-            .humidity_pct10 = (uint16_t)(hum),
+            .temperature_c10 = fresh ? (int16_t)((temp + (temp < 0 ? -5 : 5)) / 10) : INT16_MIN,
+            .pressure_hpa10 = fresh ? (uint16_t)((press + 5) / 10) : 0xFFFF,
+            .humidity_pct10 = fresh ? (uint16_t)hum : 0xFFFF,
             .battery_mv = batt_mv,
             .reserved = 0xFFFFFFFF
         };
 
         /* Write to flash */
         log_write_entry(&entry);
-
-        /* Check for serial commands before sleeping */
-        if (USART1->SR & USART_SR_RXNE) {
-            process_serial_commands();
-        }
 
         /* Enter Stop mode until next RTC alarm */
         enter_stop_mode();
@@ -520,6 +593,17 @@ void cmd_dump_log(void) {
             continue;
         }
 
+        /* Sensor did not answer: empty fields, not invented numbers */
+        if (entry.temperature_c10 == INT16_MIN) {
+            snprintf(buf, sizeof(buf), "%lu,,,,%u\r\n",
+                     (unsigned long)entry.timestamp, entry.battery_mv);
+            uart_send_string(buf);
+            addr += ENTRY_SIZE;
+            if (addr >= FLASH_LOG_END) addr = FLASH_LOG_START;
+            count++;
+            continue;
+        }
+
         int16_t t_whole = entry.temperature_c10 / 10;
         uint16_t t_frac = (entry.temperature_c10 < 0 ? -entry.temperature_c10 : entry.temperature_c10) % 10;
         snprintf(buf, sizeof(buf),
@@ -541,6 +625,12 @@ void cmd_dump_log(void) {
     uart_send_string(buf);
 }
 ```
+
+### Check it
+
+- After an hour, press reset and type `d`: about 60 lines, timestamps 60 apart (far from 60: the LSI is keeping time). Reset and dump again: the old lines are still there.
+- A fresh CR2032 shows `battery_mv` near 3000. With the BME280's SDA wire pulled, entries keep coming with empty sensor fields.
+- A multimeter (uA range) in the battery lead shows the sleeping current that decides the life: tens of uA with the LED and regulator removed, mA if a part is still on. Put your numbers into the budget.
 
 ## Production Firmware Considerations
 
@@ -591,8 +681,10 @@ void jump_to_bootloader(void) {
     /* System memory base address for STM32F103 */
     uint32_t sys_mem_addr = 0x1FFFF000;
 
-    /* Disable all interrupts */
+    /* Disable all interrupts, and stop SysTick so that it cannot fire
+     * into the bootloader */
     __disable_irq();
+    SysTick->CTRL = 0;
 
     /* Reset all peripherals */
     RCC->APB1RSTR = 0xFFFFFFFF;
@@ -679,7 +771,7 @@ For real low-power operation, remove the power LED and the regulator and power t
 <InArticleAd />
 
 
-<Card title="Lesson 9 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
 **Low-power design:**
 - STM32 Sleep, Stop, and Standby modes with current consumption and tradeoffs

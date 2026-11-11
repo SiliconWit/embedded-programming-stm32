@@ -119,7 +119,10 @@ This file sets the size of the system. Three settings matter most at the start: 
 #define configUSE_TASK_NOTIFICATIONS    1
 #define configUSE_TRACE_FACILITY        1
 #define configUSE_IDLE_HOOK             1
-#define configUSE_TICK_HOOK             0
+#define configUSE_TICK_HOOK             1     /* keeps systick_ms counting */
+
+/* Stop with interrupts off when a check fails, so the debugger shows where */
+#define configASSERT(x) if ((x) == 0) { taskDISABLE_INTERRUPTS(); for (;;); }
 
 /* Cortex-M interrupt priorities */
 #define configKERNEL_INTERRUPT_PRIORITY         255
@@ -140,7 +143,7 @@ This file sets the size of the system. Three settings matter most at the start: 
 ```
 
 :::caution[SysTick conflict]
-FreeRTOS takes over SysTick for its tick timer. Remove any custom SysTick_Handler from your code. If you need a millisecond counter, use `xTaskGetTickCount()` instead of your own `systick_ms` variable.
+FreeRTOS takes over SysTick for its tick timer. Remove any custom SysTick_Handler from your code, and use `xTaskGetTickCount()` in new code. The I2C driver still counts `systick_ms` for its 10 ms limit, so the tick hook below keeps that count moving; without it the limit would never end.
 :::
 
 ### Makefile Updates
@@ -310,21 +313,26 @@ void rtos_init(void) {
 ```c
 void sensor_task(void *params) {
     (void)params;
-    bme280_init();
+    int sensor_ok = 0;
 
     sensor_data_t data;
 
     for (;;) {
         /* Acquire I2C bus */
         if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            bme280_read(&data.temperature_c100,
-                        &data.pressure_pa,
-                        &data.humidity_q10);
+            if (!sensor_ok) sensor_ok = bme280_init();   /* start, or start again */
+            int fresh = sensor_ok && bme280_read(&data.temperature_c100,
+                                                 &data.pressure_pa,
+                                                 &data.humidity_q10);
+            if (!fresh) sensor_ok = 0;
             xSemaphoreGive(i2c_mutex);
 
-            /* Send to both queues (the new sample is dropped if a queue is full) */
-            xQueueSend(xDisplayQueue, &data, 0);
-            xQueueSend(xLogQueue, &data, 0);
+            /* Send only fresh readings (the new sample is dropped if a queue
+             * is full). With none, the display shows "No sensor data!". */
+            if (fresh) {
+                xQueueSend(xDisplayQueue, &data, 0);
+                xQueueSend(xLogQueue, &data, 0);
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -353,9 +361,9 @@ void display_task(void *params) {
 
                 oled_string(0, 0, "FreeRTOS Dashboard");
 
-                snprintf(line, sizeof(line), "T: %ld.%02ld C",
-                         (long)(data.temperature_c100 / 100),
-                         (long)(data.temperature_c100 % 100));
+                int32_t t = data.temperature_c100;          /* sign apart */
+                snprintf(line, sizeof(line), "T: %s%ld.%02ld C", t < 0 ? "-" : "",
+                         (long)(t < 0 ? -t : t) / 100, (long)(t < 0 ? -t : t) % 100);
                 oled_string(0, 16, line);
 
                 snprintf(line, sizeof(line), "P: %lu Pa",
@@ -397,11 +405,12 @@ void logger_task(void *params) {
         /* Receive from dedicated log queue */
         if (xQueueReceive(xLogQueue, &data, pdMS_TO_TICKS(2000)) == pdTRUE) {
             sample_count++;
+            int32_t t = data.temperature_c100;
+            long ta = t < 0 ? -(long)t : (long)t;           /* sign apart */
             int len = snprintf(buf, sizeof(buf),
-                "[%06lu] T=%ld.%02ldC P=%luPa H=%lu.%lu%%\r\n",
+                "[%06lu] T=%s%ld.%02ldC P=%luPa H=%lu.%lu%%\r\n",
                 (unsigned long)sample_count,
-                (long)(data.temperature_c100 / 100),
-                (long)(data.temperature_c100 % 100),
+                t < 0 ? "-" : "", ta / 100, ta % 100,
                 (unsigned long)data.pressure_pa,
                 (unsigned long)(data.humidity_q10 / 10),
                 (unsigned long)(data.humidity_q10 % 10));
@@ -418,11 +427,17 @@ void logger_task(void *params) {
 
 ### Idle Hook (Low Power)
 
-When every task is blocked, FreeRTOS runs its own idle task, which calls the first function below. The other two are called by FreeRTOS when the heap is used up or a task writes past the end of its stack.
+When every task is blocked, FreeRTOS runs its own idle task, which calls the first function below. The tick hook runs at every 1 ms tick. The last two are called by FreeRTOS when the heap is used up or a task writes past the end of its stack.
 
 ```c
 void vApplicationIdleHook(void) {
     __WFI();  /* Enter sleep until next interrupt */
+}
+
+volatile uint32_t systick_ms = 0;  /* replaces the counter of SysTick_Handler */
+
+void vApplicationTickHook(void) {
+    systick_ms++;  /* 1 ms count used by the I2C time limit */
 }
 
 void vApplicationMallocFailedHook(void) {
@@ -443,6 +458,8 @@ void vApplicationStackOverflowHook(TaskHandle_t task, char *name) {
 ### Main: Create Tasks and Start Scheduler
 
 ```c
+TaskHandle_t sensor_handle, display_handle, logger_handle;
+
 int main(void) {
     clock_init();
     uart_init();
@@ -455,9 +472,10 @@ int main(void) {
 
     rtos_init();  /* Create queues and mutexes */
 
-    xTaskCreate(sensor_task, "Sensor", 256, NULL, 3, NULL);
-    xTaskCreate(display_task, "Display", 256, NULL, 2, NULL);
-    xTaskCreate(logger_task, "Logger", 256, NULL, 1, NULL);
+    /* Keep the handles so the debugger can ask about each task */
+    xTaskCreate(sensor_task, "Sensor", 256, NULL, 3, &sensor_handle);
+    xTaskCreate(display_task, "Display", 256, NULL, 2, &display_handle);
+    xTaskCreate(logger_task, "Logger", 256, NULL, 1, &logger_handle);
 
     uart_send_string("Starting FreeRTOS scheduler...\r\n");
 
@@ -468,6 +486,12 @@ int main(void) {
     while (1);
 }
 ```
+
+### Check it
+
+- One log line a second, the count rising by 1 each line.
+- Pull the BME280's SDA wire: within about a second the display shows `No sensor data!` and the log stops. Put it back: readings return with no reset.
+- After a few minutes, in GDB, `print uxTaskGetStackHighWaterMark(display_handle)` and the same for the other two. Under about 40 words left, give that task more stack.
 
 ## Priority Inversion: A Practical Example
 
@@ -532,7 +556,7 @@ print uxTaskGetStackHighWaterMark(sensor_handle)
 <InArticleAd />
 
 
-<Card title="Lesson 8 Complete" icon="approve-check">
+<Card title="Lesson complete" icon="approve-check">
 
 **RTOS fundamentals:**
 - Adding FreeRTOS to a bare-metal STM32 project
@@ -559,7 +583,7 @@ print uxTaskGetStackHighWaterMark(sensor_handle)
 </Card>
 
 :::tip[Next Lesson]
-In [Lesson 9: Low-Power Modes and Production Firmware](/education/embedded-programming-stm32/low-power-production-firmware), you build a data logger that sleeps between readings and runs for months on one coin cell.
+In [Low-Power Modes and Production Firmware](/education/embedded-programming-stm32/low-power-production-firmware/), you build a data logger that sleeps between readings and runs for months on one coin cell.
 :::
 
 <EmbeddedProgrammingStm32Comments />
