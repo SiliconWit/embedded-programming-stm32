@@ -460,7 +460,7 @@ PA0 carries only the signal: a pin gives about 8 mA at most, and the SG90 draws 
 3. Pull that wire: `period_us()` gives 0 within 60 ms, not the last 20000.
 
 :::tip[Instrument it]
-Input capture and the encoder interface also measure. With a Hall sensor or optical pickup, input capture is a tachometer that reads 0 when the shaft stops; an encoder on a shaft gives position and direction, so firmware can confirm an axis reached its target. The [STM32](/education/sensor-actuator-interfacing-stm32/) closes that loop itself and can [stream](/education/iot-systems/) speed and position to a [dashboard](https://siliconwit.io), where drift, slip or a stalled axis shows.
+Input capture and the encoder interface also measure. With a Hall sensor or optical pickup, input capture is a tachometer that reads 0 when the shaft stops; an encoder on a shaft gives position and direction, so firmware can confirm an axis reached its target. The [STM32](/education/sensor-actuator-interfacing-stm32/) closes that loop itself and can [stream](/education/iot-systems/) speed and position to a broker you run, or to [siliconwit.io](https://siliconwit.io), our monitoring service, where drift, slip or a stalled axis shows in the record; it works with any MQTT client.
 :::
 
 ## What You Have Learned

@@ -516,7 +516,7 @@ int main(void) {
 - The internal temperature sensor differs from chip to chip by up to about 0.09 V either way at 25 C (about 20 degrees). Trust its changes, not its value: a warm finger raises it within seconds.
 
 :::tip[Instrument it]
-Put the analog output of a vibration or current sensor on the watched channel and its limit is checked on every conversion with no processor work, which suits a motor or a pump. The [STM32](/education/sensor-actuator-interfacing-stm32/) acts locally, for example by opening a relay, and can [raise the alarm](https://siliconwit.io) so that a person sees it too.
+Put the analog output of a vibration or current sensor on the watched channel and its limit is checked on every conversion with no processor work, which suits a motor or a pump. The [STM32](/education/sensor-actuator-interfacing-stm32/) acts locally, for example by opening a relay. It can also send the event to a broker you run, or to [siliconwit.io](https://siliconwit.io), our monitoring service, which raises the alarm so that a person sees it too; it works with any MQTT client.
 :::
 
 ## What You Have Learned
